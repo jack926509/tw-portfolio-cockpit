@@ -38,8 +38,8 @@ const { code } = await build({
   target: ["es2018"],
 }).then((r) => ({ code: r.outputFiles[0].text }));
 
-// 3) 移除 @babel/standalone，並用編譯後的純 JS <script> 取代原本的 babel 區塊
-let out = html.replace(/\s*<script src="https:\/\/unpkg\.com\/@babel\/standalone[^"]*"><\/script>/, "");
+// 3) 移除 @babel/standalone（任何 CDN 主機皆可），並用編譯後的純 JS <script> 取代 babel 區塊
+let out = html.replace(/\s*<script src="https?:\/\/[^"]*@babel\/standalone[^"]*"><\/script>/, "");
 out = out.replace(babelRe, `<script>\n${code}</script>`);
 
 await mkdir(OUT_DIR, { recursive: true });
