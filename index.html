@@ -61,7 +61,34 @@
 <script type="module">import * as E from "./engine.mjs"; window.Engine = E;</script>
 
 <script type="text/babel" data-presets="react">
-const { useState, useEffect, useMemo } = React;
+const { useState, useEffect, useMemo, useRef, useDeferredValue } = React;
+
+/* 引擎 Web Worker：把重模擬（蒙地卡羅／拔靴）移出主執行緒，避免拖曳卡頓。
+   正式版 build 會注入 window.__ENGINE_SRC__（引擎原始碼字串）；開發版無此字串時
+   回傳 null，呼叫端自動退回主執行緒同步計算（功能不消失）。 */
+function makeEngineWorker() {
+  try {
+    if (typeof Worker === "undefined" || !window.__ENGINE_SRC__) return null;
+    const glue = "var window=self;" + window.__ENGINE_SRC__ +
+      ";self.onmessage=function(e){var d=e.data;try{var out=self.Engine[d.fn](d.args);self.postMessage({id:d.id,ok:true,out:out});}catch(err){self.postMessage({id:d.id,ok:false,err:String(err)});}};";
+    const url = URL.createObjectURL(new Blob([glue], { type: "text/javascript" }));
+    return new Worker(url);
+  } catch (e) { return null; }
+}
+
+/* 在 Worker 執行引擎函式；任何失敗（無 Worker／逾時／例外）皆退回 sync() 同步計算。 */
+function runEngine(worker, fn, args, sync) {
+  if (!worker) return Promise.resolve(sync());
+  return new Promise((resolve) => {
+    const id = Math.random().toString(36).slice(2);
+    let done = false;
+    const finish = (v) => { if (done) return; done = true; clearTimeout(to); worker.removeEventListener("message", onMsg); resolve(v); };
+    const onMsg = (e) => { if (e.data && e.data.id === id) finish(e.data.ok ? e.data.out : sync()); };
+    const to = setTimeout(() => finish(sync()), 6000);
+    worker.addEventListener("message", onMsg);
+    try { worker.postMessage({ id, fn, args }); } catch (err) { finish(sync()); }
+  });
+}
 const { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Line, ComposedChart } = Recharts;
 
 /* ---------- 圖示（inline SVG，免外部圖示套件） ---------- */
@@ -247,17 +274,37 @@ function App() {
   const R = useMemo(() => simulate({ instruments, mode, budget, gross, years, sweepId, tax }),
     [instruments, mode, budget, gross, years, sweepId, taxOn, divTaxRate]);
 
-  // 參數化（蒙地卡羅）只在進階＋選參數化模式時計算。
-  const MC = useMemo(() => (advanced && model === "parametric"
-    ? monteCarlo({ instruments, mode, budget, gross, years, sigma, paths, dist, nu, rho })
-    : null),
-    [advanced, model, instruments, mode, budget, gross, years, sigma, paths, dist, nu, rho]);
+  // 引擎 Worker：建一次、卸載時收掉。重模擬走 Worker，失敗自動退回主執行緒。
+  const workerRef = useRef(null);
+  useEffect(() => { workerRef.current = makeEngineWorker(); return () => { if (workerRef.current) workerRef.current.terminate(); }; }, []);
+
+  // 重模擬輸入用 useDeferredValue 延後合併：拖曳滑桿時 UI 先即時回應，模擬在低優先級重算。
+  const dInstruments = useDeferredValue(instruments);
+  const dGross = useDeferredValue(gross);
+  const dYears = useDeferredValue(years);
+  const dSigma = useDeferredValue(sigma);
+  const dPaths = useDeferredValue(paths);
+  const dRho = useDeferredValue(rho);
+
+  // 參數化（蒙地卡羅）只在進階＋選參數化模式時計算；經 Worker 非同步取得，sync 為退回路徑。
+  const [MC, setMC] = useState(null);
+  useEffect(() => {
+    if (!(advanced && model === "parametric")) { setMC(null); return; }
+    const args = { instruments: dInstruments, mode, budget, gross: dGross, years: dYears, sigma: dSigma, paths: dPaths, dist, nu, rho: dRho };
+    let cancelled = false;
+    runEngine(workerRef.current, "monteCarlo", args, () => monteCarlo(args)).then((r) => { if (!cancelled) setMC(r); });
+    return () => { cancelled = true; };
+  }, [advanced, model, dInstruments, mode, budget, dGross, dYears, dSigma, dPaths, dist, nu, dRho]);
 
   // 歷史平穩拔靴（預設模型）：借歷史波動結構，報酬以 gross 假設 recenter。
-  const BS = useMemo(() => (advanced && model === "bootstrap"
-    ? bootstrapSimulate({ instruments, mode, budget, gross, years, paths, avgBlock: 6 })
-    : null),
-    [advanced, model, instruments, mode, budget, gross, years, paths]);
+  const [BS, setBS] = useState(null);
+  useEffect(() => {
+    if (!(advanced && model === "bootstrap")) { setBS(null); return; }
+    const args = { instruments: dInstruments, mode, budget, gross: dGross, years: dYears, paths: dPaths, avgBlock: 6 };
+    let cancelled = false;
+    runEngine(workerRef.current, "bootstrapSimulate", args, () => bootstrapSimulate(args)).then((r) => { if (!cancelled) setBS(r); });
+    return () => { cancelled = true; };
+  }, [advanced, model, dInstruments, mode, budget, dGross, dYears, dPaths]);
 
   // 統一給圖表用的模擬結果（兩模型 series 同形）。
   const SIM = model === "bootstrap" ? BS : MC;
