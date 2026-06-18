@@ -83,10 +83,10 @@ const C = {
 const PALETTE = ["#1FA088", "#3B6FE2", "#E39A2B", "#E23B4E", "#8A4FE2", "#2BB0E3", "#E2693B", "#5A9E2B"];
 
 const DEFAULTS = [
-  { id: "009816", name: "凱基台灣TOP50", ticker: "009816", price: 15.3, alloc: 50, fee: 0.10, divYield: 0, tsmcW: 43.5, distributes: false, color: "#1FA088" },
-  { id: "0050",   name: "元大台灣50",     ticker: "0050",   price: 105,  alloc: 0,  fee: 0.15, divYield: 2.0, tsmcW: 64.5, distributes: true,  color: "#3B6FE2" },
-  { id: "00981A", name: "主動統一台股增長", ticker: "00981A", price: 30.8, alloc: 30, fee: 1.0,  divYield: 3.0, tsmcW: 28,   distributes: true,  color: "#E39A2B" },
-  { id: "2330",   name: "台積電",          ticker: "2330",   price: 2385, alloc: 20, fee: 0,    divYield: 0.9, tsmcW: 100,  distributes: true,  color: "#E23B4E" },
+  { id: "009816", name: "凱基台灣TOP50", ticker: "009816", price: 15.3, alloc: 50, fee: 0.10, divYield: 0, tsmcW: 43.5, distributes: false, sigma: 18, color: "#1FA088" },
+  { id: "0050",   name: "元大台灣50",     ticker: "0050",   price: 105,  alloc: 0,  fee: 0.15, divYield: 2.0, tsmcW: 64.5, distributes: true,  sigma: 18, color: "#3B6FE2" },
+  { id: "00981A", name: "主動統一台股增長", ticker: "00981A", price: 30.8, alloc: 30, fee: 1.0,  divYield: 3.0, tsmcW: 28,   distributes: true,  sigma: 22, color: "#E39A2B" },
+  { id: "2330",   name: "台積電",          ticker: "2330",   price: 2385, alloc: 20, fee: 0,    divYield: 0.9, tsmcW: 100,  distributes: true,  sigma: 30, color: "#E23B4E" },
 ];
 
 const fmtWan = (v) => (v / 10000).toFixed(v >= 1e6 ? 0 : 1) + "萬";
@@ -124,12 +124,21 @@ const STORE_KEY = "tw_cockpit_v1";
 /* 單一標的的欄位模板：載入舊資料時用來補齊新增欄位、清理型別 */
 const INSTRUMENT_DEFAULT = {
   id: "", name: "新標的", ticker: "", price: 100, alloc: 0, fee: 0.3,
-  divYield: 2, tsmcW: 0, distributes: true, color: PALETTE[0],
+  divYield: 2, tsmcW: 0, distributes: true, sigma: 20, color: PALETTE[0],
 };
 const DEFAULT_STATE = {
   instruments: DEFAULTS, mode: "monthly", budget: 15000, gross: 7, years: 20,
   sweepId: "009816", sigma: 18, paths: 1500, advanced: false,
   model: "bootstrap", backtest: false,
+  dist: "normal", nu: 5, rho: 0.7, cape: 0,
+};
+
+/* 情境預設：一鍵套用報酬假設與參數化分布／相關設定。
+   保守＝低報酬高相關＋厚尾；中性＝歷史中庸；樂觀＝高報酬低相關。 */
+const PRESETS = {
+  保守: { gross: 4, rho: 0.85, dist: "t", nu: 4 },
+  中性: { gross: 6, rho: 0.70, dist: "normal", nu: 5 },
+  樂觀: { gross: 9, rho: 0.55, dist: "normal", nu: 5 },
 };
 
 /* 把任意（可能是舊版／殘缺）的 parsed 物件清成合法 state，缺漏一律回退預設。
@@ -151,6 +160,7 @@ function sanitizeState(d) {
       fee: num(i.fee ?? INSTRUMENT_DEFAULT.fee),
       divYield: num(i.divYield ?? INSTRUMENT_DEFAULT.divYield),
       tsmcW: num(i.tsmcW ?? INSTRUMENT_DEFAULT.tsmcW),
+      sigma: num(i.sigma ?? INSTRUMENT_DEFAULT.sigma),
       distributes: i.distributes != null ? !!i.distributes : INSTRUMENT_DEFAULT.distributes,
       color: i.color || PALETTE[idx % PALETTE.length],
     }));
@@ -169,6 +179,10 @@ function sanitizeState(d) {
     advanced: !!d.advanced,
     model: d.model === "parametric" ? "parametric" : "bootstrap",
     backtest: !!d.backtest,
+    dist: d.dist === "t" ? "t" : "normal",
+    nu: Math.min(30, Math.max(3, Math.round(num(d.nu, 3)) || DEFAULT_STATE.nu)),
+    rho: Math.min(1, Math.max(0, num(d.rho))),
+    cape: num(d.cape),
   };
 }
 
@@ -184,6 +198,10 @@ function App() {
   const [advanced, setAdvanced] = useState(false);
   const [model, setModel] = useState("bootstrap");   // 'bootstrap'（歷史拔靴，預設）| 'parametric'
   const [backtest, setBacktest] = useState(false);   // 回測校驗頁籤是否展開
+  const [dist, setDist] = useState("normal");        // 參數化分布：'normal' | 't'（厚尾）
+  const [nu, setNu] = useState(5);                   // Student-t 自由度（愈小尾愈胖）
+  const [rho, setRho] = useState(0.7);               // 標的間平均相關係數（單因子等相關）
+  const [cape, setCape] = useState(0);               // 台股 CAPE（席勒本益比），0＝不參考
   const [loaded, setLoaded] = useState(false);
   const [priceStatus, setPriceStatus] = useState(null); // {state:'loading'|'ok'|'err', msg, date}
 
@@ -192,6 +210,13 @@ function App() {
     setGross(s.gross); setYears(s.years); setSweepId(s.sweepId);
     setSigma(s.sigma); setPaths(s.paths); setAdvanced(s.advanced);
     setModel(s.model); setBacktest(s.backtest);
+    setDist(s.dist); setNu(s.nu); setRho(s.rho); setCape(s.cape);
+  };
+
+  // 套用情境預設：設定毛報酬與參數化分布／相關，並切到參數化模式方便對照。
+  const applyPreset = (p) => {
+    const v = PRESETS[p]; if (!v) return;
+    setGross(v.gross); setRho(v.rho); setDist(v.dist); setNu(v.nu); setModel("parametric");
   };
 
   useEffect(() => {
@@ -204,18 +229,18 @@ function App() {
 
   useEffect(() => {
     if (!loaded) return;
-    try { localStorage.setItem(STORE_KEY, JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest })); }
+    try { localStorage.setItem(STORE_KEY, JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest, dist, nu, rho, cape })); }
     catch (e) { /* 忽略 */ }
-  }, [instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest, loaded]);
+  }, [instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest, dist, nu, rho, cape, loaded]);
 
   const R = useMemo(() => simulate({ instruments, mode, budget, gross, years, sweepId }),
     [instruments, mode, budget, gross, years, sweepId]);
 
   // 參數化（蒙地卡羅）只在進階＋選參數化模式時計算。
   const MC = useMemo(() => (advanced && model === "parametric"
-    ? monteCarlo({ instruments, mode, budget, gross, years, sigma, paths })
+    ? monteCarlo({ instruments, mode, budget, gross, years, sigma, paths, dist, nu, rho })
     : null),
-    [advanced, model, instruments, mode, budget, gross, years, sigma, paths]);
+    [advanced, model, instruments, mode, budget, gross, years, sigma, paths, dist, nu, rho]);
 
   // 歷史平穩拔靴（預設模型）：借歷史波動結構，報酬以 gross 假設 recenter。
   const BS = useMemo(() => (advanced && model === "bootstrap"
@@ -296,7 +321,7 @@ function App() {
 
   // 設定匯出/匯入（JSON），方便備份與分享；匯入一律經 sanitizeState 清理。
   const exportConfig = () => {
-    const blob = new Blob([JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest }, null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest, dist, nu, rho, cape }, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url; a.download = "tw-cockpit-config.json"; a.click();
@@ -451,11 +476,11 @@ function App() {
                 </button>
               </div>
 
-              {/* 控制列：參數化才有 σ 滑桿 */}
+              {/* 控制列：參數化顯示相關係數 ρ（σ 已改為各標的欄位） */}
               <div className="grid2" style={{ display: "grid", gridTemplateColumns: model === "parametric" ? "1fr 1fr auto" : "1fr auto", gap: 16, alignItems: "center", marginBottom: 12 }}>
                 {model === "parametric" && (
-                  <Field label={"年化波動度（標準差）— " + sigma + "%"}>
-                    <input type="range" min="0" max="40" step="1" value={sigma} onChange={(e) => setSigma(num(e.target.value))} aria-label="年化波動度標準差" style={{ accentColor: C.blue }} />
+                  <Field label={"標的間平均相關係數 ρ — " + rho.toFixed(2)}>
+                    <input type="range" min="0" max="1" step="0.05" value={rho} onChange={(e) => setRho(num(e.target.value))} aria-label="標的間平均相關係數" style={{ accentColor: C.blue }} />
                   </Field>
                 )}
                 <Field label="模擬路徑數">
@@ -474,6 +499,47 @@ function App() {
                   </div>
                 )}
               </div>
+
+              {/* 參數化：情境預設、報酬分布、CAPE 估值參考 */}
+              {model === "parametric" && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 14, alignItems: "center", marginBottom: 12, padding: "10px 12px", background: "#F4F7FA", borderRadius: 10 }}>
+                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    <span style={{ fontSize: 11, color: C.muted }}>情境預設</span>
+                    {Object.keys(PRESETS).map((p) => (
+                      <button key={p} className="btn" onClick={() => applyPreset(p)} style={{ padding: "4px 10px", fontSize: 12 }}>{p}</button>
+                    ))}
+                  </div>
+                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    <span style={{ fontSize: 11, color: C.muted }}>報酬分布</span>
+                    {[["normal", "常態"], ["t", "厚尾 t"]].map(([k, lab]) => (
+                      <button key={k} className="btn" onClick={() => setDist(k)} aria-pressed={dist === k}
+                        style={{ padding: "4px 10px", fontSize: 12, background: dist === k ? C.blue : "#fff", color: dist === k ? "#fff" : C.muted, borderColor: dist === k ? C.blue : C.border }}>{lab}</button>
+                    ))}
+                    {dist === "t" && (
+                      <label style={{ fontSize: 11, color: C.muted, display: "flex", gap: 4, alignItems: "center" }}>
+                        自由度 ν
+                        <select style={{ ...numInput, fontFamily: "var(--sans)", width: 56 }} value={nu} onChange={(e) => setNu(Math.max(3, num(e.target.value, 3)))} aria-label="Student-t 自由度">
+                          {[3, 4, 5, 6, 8, 10].map((n) => <option key={n} value={n}>{n}</option>)}
+                        </select>
+                      </label>
+                    )}
+                  </div>
+                  <label style={{ fontSize: 11, color: C.muted, display: "flex", gap: 4, alignItems: "center" }}>
+                    台股 CAPE
+                    <input className="num" type="number" min="0" step="0.5" value={cape} onChange={(e) => setCape(num(e.target.value))} aria-label="台股 CAPE 席勒本益比" style={{ ...numInput, width: 64 }} />
+                  </label>
+                  {cape > 0 && (() => {
+                    const er = window.Engine.valuationAdjustedReturn({ cape });
+                    const hot = er < gross;
+                    return (
+                      <span style={{ fontSize: 11, color: hot ? C.red : C.jade, lineHeight: 1.4 }}>
+                        盈餘殖利率推估長期報酬約 <b className="num">{er.toFixed(1)}%</b>
+                        {hot ? "，低於你的毛報酬假設 " + gross + "%，估值偏高、假設可能偏樂觀。" : "，不低於你的假設，估值相對合理。"}
+                      </span>
+                    );
+                  })()}
+                </div>
+              )}
 
               {/* 統計卡：兩模型不同 */}
               {model === "parametric" ? (
@@ -556,7 +622,7 @@ function App() {
             <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 720 }}>
               <thead>
                 <tr style={{ fontSize: 10.5, color: C.muted, textAlign: "left" }}>
-                  {["", "名稱", "代號", "股價", "配置%", "內扣%", "現金殖利%", "台積權重%", "配息", "股數", ""].map((h, j) => (
+                  {["", "名稱", "代號", "股價", "配置%", "內扣%", "現金殖利%", "台積權重%", "波動%", "配息", "股數", ""].map((h, j) => (
                     <th key={j} style={{ padding: "4px 6px", fontWeight: 500, letterSpacing: ".02em" }}>{h}</th>
                   ))}
                 </tr>
@@ -572,6 +638,7 @@ function App() {
                     <td style={{ padding: "6px" }}><input className="num" aria-label={b.name + " 內扣%"} style={{ ...numInput, width: 56 }} type="number" min="0" step="0.01" value={b.fee} onChange={(e) => update(b.id, "fee", num(e.target.value))} /></td>
                     <td style={{ padding: "6px" }}><input className="num" aria-label={b.name + " 現金殖利%"} style={{ ...numInput, width: 56 }} type="number" min="0" step="0.1" value={b.divYield} onChange={(e) => update(b.id, "divYield", num(e.target.value))} /></td>
                     <td style={{ padding: "6px" }}><input className="num" aria-label={b.name + " 台積權重%"} style={{ ...numInput, width: 58 }} type="number" min="0" step="0.5" value={b.tsmcW} onChange={(e) => update(b.id, "tsmcW", num(e.target.value))} /></td>
+                    <td style={{ padding: "6px" }}><input className="num" aria-label={b.name + " 年化波動%"} style={{ ...numInput, width: 56 }} type="number" min="0" step="1" value={b.sigma} onChange={(e) => update(b.id, "sigma", num(e.target.value))} /></td>
                     <td style={{ padding: "6px", textAlign: "center" }}>
                       <input type="checkbox" aria-label={b.name + " 是否配息"} checked={b.distributes} onChange={(e) => update(b.id, "distributes", e.target.checked)} style={{ accentColor: C.jade, width: 16, height: 16 }} />
                     </td>
@@ -590,6 +657,7 @@ function App() {
           <div style={{ fontSize: 11, color: C.muted, marginTop: 8, lineHeight: 1.6 }}>
             「台積權重%」是該標的內部持有多少台積電（2330 填 100、非電子股填 0），用來算最上方的穿透集中度。
             「配息」打勾的標的，其現金股利會在每年底自動掃進你選的複利目標（預設 009816）；目標本身不配息、全部滾入再投資。
+            「波動%」是各標的年化波動度，供進階「參數化」模型逐標的模擬用（市值型 ETF 約 18、主動型約 22、個股約 30）；歷史拔靴模型不使用此欄。
           </div>
         </div>
 
