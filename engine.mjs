@@ -53,10 +53,20 @@ export function quantile(sorted, p) {
   return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
 }
 
+/* ---------- 台灣股利稅負 ----------
+   單筆股利 ≥ 門檻（預設 NT$20,000）課二代健保補充保費（預設 2.11%，就全額計）；
+   另就股利全額課所得稅（divTaxRate%，可填合併或分離 28% 的有效稅率）。回傳稅後淨額。 */
+export function applyDividendTax(div, { supplement = true, divTaxRate = 0, threshold = 20000, supplementRate = 0.0211 } = {}) {
+  const d = Math.max(0, +div || 0);
+  const sup = supplement && d >= threshold ? d * supplementRate : 0;
+  const tax = d * (Math.max(0, +divTaxRate || 0) / 100);
+  return Math.max(0, d - sup - tax);
+}
+
 /* ---------- 確定性試算引擎（連續複利） ----------
    月成長率採連續複利 exp(a/12)-1，使「年化報酬 a、t 年」單筆期末
    恰為 本金·e^(a·t)；σ=0 的蒙地卡羅亦由此貼齊（核心一致性）。     */
-export function simulate({ instruments, mode, budget, gross, years, sweepId }) {
+export function simulate({ instruments, mode, budget, gross, years, sweepId, tax = null }) {
   const list = instruments;
   const sumAlloc = list.reduce((s, i) => s + Math.max(0, +i.alloc || 0), 0) || 1;
   const amt = {};
@@ -93,7 +103,8 @@ export function simulate({ instruments, mode, budget, gross, years, sweepId }) {
       let swept = 0;
       list.forEach((i) => {
         if (i.id !== validSweep && i.distributes) {
-          const d = bal[i.id] * (i.divYield / 100);
+          let d = bal[i.id] * (i.divYield / 100);
+          if (tax) d = applyDividendTax(d, tax);   // 稅後才掃入再投資
           swept += d;
           if (validSweep) bal[validSweep] += d;
         }
@@ -295,6 +306,22 @@ export function historicalBacktest({ pool = HIST_RETURNS.monthly, mode, budget, 
     invested,
     last: { finalValue: lastWin.final, series: lastWin.series },
   };
+}
+
+/* ---------- 實質購買力平減 ----------
+   把名目序列平減為「今天的購買力」：第 y 年的值除以 (1+infl)^y。
+   平減 p10/p50/p90/invested/total/hist 與 band 兩端；infl=0 時原樣回傳。       */
+export function toReal(series, { infl = 0 } = {}) {
+  const r = (Math.max(0, +infl || 0)) / 100;
+  if (r === 0) return series.map((pt) => ({ ...pt }));
+  const KEYS = ["p10", "p50", "p90", "invested", "total", "hist"];
+  return series.map((pt) => {
+    const f = Math.pow(1 + r, pt.year || 0);
+    const out = { ...pt };
+    for (const k of KEYS) if (typeof out[k] === "number") out[k] = out[k] / f;
+    if (Array.isArray(out.band)) out.band = out.band.map((v) => v / f);
+    return out;
+  });
 }
 
 /* ---------- 風險指標：最大回撤分布 / CVaR / 達標率 ----------

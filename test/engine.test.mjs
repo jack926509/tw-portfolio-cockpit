@@ -167,6 +167,53 @@ test('valuationAdjustedReturn: 無效 CAPE 回退 0', () => {
   assert.equal(valuationAdjustedReturn({ cape: 'x' }), 0);
 });
 
+/* ---------- Task 4.1：applyDividendTax 股利稅負 ---------- */
+
+import { applyDividendTax } from '../engine.mjs';
+
+test('applyDividendTax: 未達 2 萬門檻不課二代健保補充保費', () => {
+  assert.ok(Math.abs(applyDividendTax(19999, { supplement: true, divTaxRate: 0 }) - 19999) < 1e-9);
+});
+
+test('applyDividendTax: 達門檻課 2.11% 補充保費 + 股利稅', () => {
+  const net = applyDividendTax(100000, { supplement: true, divTaxRate: 28 });
+  assert.ok(Math.abs(net - 100000 * (1 - 0.0211 - 0.28)) < 1e-6, `net=${net}`);
+});
+
+test('applyDividendTax: 關閉補充保費、零稅率 → 原額', () => {
+  assert.ok(Math.abs(applyDividendTax(100000, { supplement: false, divTaxRate: 0 }) - 100000) < 1e-9);
+});
+
+test('simulate: 開啟稅負後期末低於未課稅（配息標的）', () => {
+  const two = [
+    { id: 's', ticker: 's', price: 10, alloc: 50, fee: 0, divYield: 0, tsmcW: 0, distributes: false, sigma: 18 },
+    { id: 'd', ticker: 'd', price: 10, alloc: 50, fee: 0, divYield: 5, tsmcW: 0, distributes: true, sigma: 18 },
+  ];
+  const base = { instruments: two, sweepId: 's', mode: 'lump', budget: 10000000, gross: 6, years: 10 };
+  const noTax = simulate(base).finalTotal;
+  const taxed = simulate({ ...base, tax: { supplement: true, divTaxRate: 28 } }).finalTotal;
+  assert.ok(taxed < noTax, `taxed ${taxed} 應 < noTax ${noTax}`);
+});
+
+/* ---------- Task 4.2：toReal 實質購買力平減 ---------- */
+
+import { toReal } from '../engine.mjs';
+
+test('toReal: 平減公式 value/(1+infl)^year', () => {
+  const series = [{ year: 0, p50: 100, band: [90, 110] }, { year: 1, p50: 110, band: [99, 121] }];
+  const r = toReal(series, { infl: 10 });
+  assert.ok(Math.abs(r[0].p50 - 100) < 1e-9);
+  assert.ok(Math.abs(r[1].p50 - 110 / 1.1) < 1e-9, `p50=${r[1].p50}`);
+  assert.ok(Math.abs(r[1].band[0] - 99 / 1.1) < 1e-9 && Math.abs(r[1].band[1] - 121 / 1.1) < 1e-9, '帶也需平減');
+});
+
+test('toReal: infl=0 不改變', () => {
+  const series = [{ year: 3, p50: 500, invested: 300 }];
+  const r = toReal(series, { infl: 0 });
+  assert.equal(r[0].p50, 500);
+  assert.equal(r[0].invested, 300);
+});
+
 /* ---------- Task 2.1：HIST_RETURNS 歷史月報酬資料 ---------- */
 
 import { HIST_RETURNS } from '../engine.mjs';
