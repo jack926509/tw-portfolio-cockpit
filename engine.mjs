@@ -173,6 +173,56 @@ export function stationaryBootstrap({ pool, months, paths, avgBlock, recenterTo 
   return out;
 }
 
+/* ---------- 歷史平穩拔靴模擬（預設模型） ----------
+   以 HIST_RETURNS 月報酬為 pool 做平穩拔靴，但用 recenterTo 把均值平移到使用者的報酬假設
+   （μ = gross − 配置加權內扣，視為算術年報酬），故借用歷史的波動結構/厚尾/序列相依，
+   不強加歷史的高報酬。回傳與 monteCarlo 同形 series（year/p10/p50/p90/band/invested）＋ risk。 */
+export function bootstrapSimulate({ instruments, mode, budget, gross, years, paths, avgBlock = 6, seed, target }) {
+  const list = instruments;
+  const sumAlloc = list.reduce((s, i) => s + num(i.alloc), 0) || 1;
+  const wFee = list.reduce((s, i) => s + (num(i.alloc) / sumAlloc) * num(i.fee), 0);
+  const muAnnual = (gross - wFee) / 100;
+  const recenterTo = muAnnual / 12;                 // 目標月（算術）均值
+  const months = years * 12;
+  const N = Math.max(1, Math.round(paths));
+  const rng = makeRng(seed != null ? seed : 1234567);
+
+  const samples = stationaryBootstrap({ pool: HIST_RETURNS.monthly, months, paths: N, avgBlock, recenterTo, rng });
+
+  const start = mode === "lump" ? budget : 0;
+  const contrib = mode === "monthly" ? budget : 0;
+
+  // 各路徑：逐月套用報酬，記錄各年底資產值（年值序列亦供回撤計算）
+  const yearVals = Array.from({ length: years + 1 }, () => new Float64Array(N));
+  const yearPaths = [];                              // paths × (years+1)，給 riskMetrics 算回撤
+  for (let p = 0; p < N; p++) {
+    let bal = start;
+    const row = samples[p];
+    const yp = new Array(years + 1); yp[0] = bal; yearVals[0][p] = bal;
+    for (let m = 1; m <= months; m++) {
+      bal += contrib;
+      bal *= 1 + row[m - 1];
+      if (bal < 0) bal = 0;                          // 月報酬理論下限 -100%
+      if (m % 12 === 0) { yearVals[m / 12][p] = bal; yp[m / 12] = bal; }
+    }
+    yearPaths.push(yp);
+  }
+
+  const series = yearVals.map((arr, y) => {
+    const sorted = Float64Array.prototype.slice.call(arr).sort((a, b) => a - b);
+    const p10 = quantile(sorted, 0.10), p50 = quantile(sorted, 0.50), p90 = quantile(sorted, 0.90);
+    return { year: y, p10, p50, p90, band: [p10, p90], invested: mode === "lump" ? budget : budget * y * 12 };
+  });
+
+  const invested = mode === "lump" ? budget : budget * months;
+  const finalsArr = Float64Array.prototype.slice.call(yearVals[years]);
+  const finalsSorted = finalsArr.slice().sort((a, b) => a - b);
+  const medianFinal = quantile(finalsSorted, 0.50);
+  const risk = riskMetrics(finalsArr, yearPaths, { target: target != null ? target : invested, invested });
+
+  return { series, invested, medianFinal, medianMultiple: invested ? medianFinal / invested : 0, risk, paths: N };
+}
+
 /* ---------- 風險指標：最大回撤分布 / CVaR / 達標率 ----------
    finals：各路徑期末資產陣列；paths2D：各路徑「資產價值序列」（用來算回撤）。
    - maxDrawdownP50/P90：各路徑最大回撤（峰到谷跌幅）的中位數與第 90 百分位（愈高愈差）。

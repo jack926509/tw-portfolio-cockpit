@@ -152,3 +152,24 @@ test('riskMetrics: CVaR(5%)=最差5%期末均值、達標率、回撤分位', ()
   assert.ok(Math.abs(m.maxDrawdownP50 - 0.35) < 1e-9, `P50=${m.maxDrawdownP50}`);
   assert.ok(Math.abs(m.maxDrawdownP90 - 0.47) < 1e-9, `P90=${m.maxDrawdownP90}`);
 });
+
+/* ---------- Task 2.4：bootstrapSimulate 組裝 ---------- */
+
+import { bootstrapSimulate } from '../engine.mjs';
+
+test('bootstrapSimulate: 機率帶有寬度、達標率∈[0,1]、可重現', () => {
+  const args = { instruments: INST1, mode: 'lump', budget: 10000, gross: 6, years: 20, paths: 300, avgBlock: 6, seed: 42, target: 20000 };
+  const a = bootstrapSimulate(args), b = bootstrapSimulate(args);
+  const last = a.series[a.series.length - 1];
+  assert.ok(last.p90 > last.p10, 'P90 應 > P10');
+  assert.ok(last.p50 > 0);
+  assert.ok(a.risk.successRate >= 0 && a.risk.successRate <= 1, `successRate=${a.risk.successRate}`);
+  assert.equal(a.series[20].p50, b.series[20].p50);  // 同種子可重現
+});
+
+test('bootstrapSimulate: 期末中位數隨報酬假設提高而提高（recenter 生效）', () => {
+  const base = { instruments: INST1, mode: 'lump', budget: 10000, years: 20, paths: 300, avgBlock: 6, seed: 7 };
+  const lo = bootstrapSimulate({ ...base, gross: 2 }).series[20].p50;
+  const hi = bootstrapSimulate({ ...base, gross: 10 }).series[20].p50;
+  assert.ok(hi > lo, `hi ${hi} 應 > lo ${lo}`);
+});
