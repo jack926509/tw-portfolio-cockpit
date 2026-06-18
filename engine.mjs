@@ -149,6 +149,30 @@ export function monteCarlo({ instruments, mode, budget, gross, years, sigma, pat
   return { series, invested, medianFinal, medianMultiple: invested ? medianFinal / invested : 0, aboveInvested, aboveDouble, cagrImplied, paths: N };
 }
 
+/* ---------- 平穩拔靴（Politis–Romano 1994） ----------
+   從歷史月報酬 pool 以「幾何分布區塊長度」重抽，保留波動叢聚與序列相依（厚尾、序列報酬風險）。
+   每步以機率 p=1/avgBlock 重新隨機選起點，否則沿用前一索引 +1（環狀繞回）。
+   recenterTo 不為 null 時，整體平移使每筆報酬期望均值落在 recenterTo（僅借結構、不借歷史高報酬）。
+   回傳 paths × months 的二維陣列。avgBlock=1 等同 IID 重抽。               */
+export function stationaryBootstrap({ pool, months, paths, avgBlock, recenterTo = null, rng }) {
+  const L = pool.length;
+  const p = 1 / Math.max(1, avgBlock);
+  const poolMean = pool.reduce((s, x) => s + x, 0) / L;
+  const shift = recenterTo == null ? 0 : recenterTo - poolMean;
+  const out = [];
+  for (let pa = 0; pa < paths; pa++) {
+    const row = new Array(months);
+    let idx = Math.floor(rng() * L);
+    for (let t = 0; t < months; t++) {
+      if (t === 0 || rng() < p) idx = Math.floor(rng() * L);  // 開新區塊
+      else idx = (idx + 1) % L;                               // 沿用區塊
+      row[t] = pool[idx] + shift;
+    }
+    out.push(row);
+  }
+  return out;
+}
+
 /* ---------- 台股歷史月報酬（含息，平穩拔靴用） ----------
    來源：FinMind TaiwanStockTotalReturnIndex（data_id=TAIEX，發行量加權股價「報酬」指數，
    股利已再投入），取每月最後交易日收盤計算月報酬。區間 2003-02..2026-05，共 280 筆。

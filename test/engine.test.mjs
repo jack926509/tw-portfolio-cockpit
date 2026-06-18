@@ -100,3 +100,41 @@ test('HIST_RETURNS: 長度與數值合理', () => {
   assert.ok(typeof HIST_RETURNS.range === 'string' && HIST_RETURNS.range.length > 0, '需標註區間');
   assert.ok(typeof HIST_RETURNS.source === 'string' && HIST_RETURNS.source.length > 0, '需標註來源');
 });
+
+/* ---------- Task 2.2：stationaryBootstrap 平穩拔靴 ---------- */
+
+import { stationaryBootstrap } from '../engine.mjs';
+
+// 計算各路徑 lag-1 自相關的平均（用來驗證序列相依是否被保留）
+function avgLag1(paths) {
+  let acc = 0, k = 0;
+  for (const row of paths) {
+    const n = row.length, m = row.reduce((s, x) => s + x, 0) / n;
+    let num = 0, den = 0;
+    for (let i = 0; i < n; i++) { den += (row[i] - m) ** 2; if (i) num += (row[i] - m) * (row[i - 1] - m); }
+    if (den > 0) { acc += num / den; k++; }
+  }
+  return acc / k;
+}
+
+test('stationaryBootstrap: 輸出形狀正確', () => {
+  const out = stationaryBootstrap({ pool: [0.01, -0.02, 0.03], months: 12, paths: 50, avgBlock: 6, rng: makeRng(3) });
+  assert.equal(out.length, 50);
+  assert.equal(out[0].length, 12);
+});
+
+test('stationaryBootstrap: recenter 後路徑平均月報酬≈目標', () => {
+  const out = stationaryBootstrap({ pool: [0.05, -0.03, 0.02, 0.04], months: 120, paths: 500, avgBlock: 6, recenterTo: 0.005, rng: makeRng(4) });
+  const all = out.flat();
+  const m = all.reduce((s, x) => s + x, 0) / all.length;
+  assert.ok(Math.abs(m - 0.005) < 5e-4, `平均 ${m}`);
+});
+
+test('stationaryBootstrap: 保留序列相依（區塊 vs IID 對照）', () => {
+  // 用正自相關的 AR(1) 序列當 pool
+  const r = makeRng(11); const pool = []; let x = 0;
+  for (let i = 0; i < 240; i++) { x = 0.8 * x + (r() - 0.5) * 0.1; pool.push(x); }
+  const block = stationaryBootstrap({ pool, months: 240, paths: 30, avgBlock: 12, rng: makeRng(5) });
+  const iid = stationaryBootstrap({ pool, months: 240, paths: 30, avgBlock: 1, rng: makeRng(5) });
+  assert.ok(avgLag1(block) > avgLag1(iid) + 0.2, `block ${avgLag1(block).toFixed(3)} 應顯著高於 IID ${avgLag1(iid).toFixed(3)}`);
+});
