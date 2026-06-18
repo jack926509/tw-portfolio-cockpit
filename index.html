@@ -96,7 +96,7 @@ const fmtNT = (v) => "NT$" + Math.round(v).toLocaleString();
    dev 由上方 <script type="module"> 注入 window.Engine；正式版由 build.mjs 內聯為全域 Engine。
    引擎含 num / quantile / makeRng / gaussianPair / simulate / monteCarlo，
    皆有 test/engine.test.mjs 單元測試把關（σ=0 一致性、連續複利、GBM 對數常態等）。 */
-const { num, simulate, monteCarlo } = window.Engine;
+const { num, simulate, monteCarlo, bootstrapSimulate, historicalBacktest } = window.Engine;
 
 /* ---------- UI 小元件 ---------- */
 const Field = ({ label, children }) => (
@@ -129,6 +129,7 @@ const INSTRUMENT_DEFAULT = {
 const DEFAULT_STATE = {
   instruments: DEFAULTS, mode: "monthly", budget: 15000, gross: 7, years: 20,
   sweepId: "009816", sigma: 18, paths: 1500, advanced: false,
+  model: "bootstrap", backtest: false,
 };
 
 /* 把任意（可能是舊版／殘缺）的 parsed 物件清成合法 state，缺漏一律回退預設。
@@ -166,6 +167,8 @@ function sanitizeState(d) {
     sigma: num(d.sigma),
     paths: Math.min(20000, Math.max(100, Math.round(num(d.paths, 100)) || DEFAULT_STATE.paths)),
     advanced: !!d.advanced,
+    model: d.model === "parametric" ? "parametric" : "bootstrap",
+    backtest: !!d.backtest,
   };
 }
 
@@ -179,6 +182,8 @@ function App() {
   const [sigma, setSigma] = useState(18);
   const [paths, setPaths] = useState(1500);
   const [advanced, setAdvanced] = useState(false);
+  const [model, setModel] = useState("bootstrap");   // 'bootstrap'（歷史拔靴，預設）| 'parametric'
+  const [backtest, setBacktest] = useState(false);   // 回測校驗頁籤是否展開
   const [loaded, setLoaded] = useState(false);
   const [priceStatus, setPriceStatus] = useState(null); // {state:'loading'|'ok'|'err', msg, date}
 
@@ -186,6 +191,7 @@ function App() {
     setInstruments(s.instruments); setMode(s.mode); setBudget(s.budget);
     setGross(s.gross); setYears(s.years); setSweepId(s.sweepId);
     setSigma(s.sigma); setPaths(s.paths); setAdvanced(s.advanced);
+    setModel(s.model); setBacktest(s.backtest);
   };
 
   useEffect(() => {
@@ -198,18 +204,40 @@ function App() {
 
   useEffect(() => {
     if (!loaded) return;
-    try { localStorage.setItem(STORE_KEY, JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced })); }
+    try { localStorage.setItem(STORE_KEY, JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest })); }
     catch (e) { /* 忽略 */ }
-  }, [instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, loaded]);
+  }, [instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest, loaded]);
 
   const R = useMemo(() => simulate({ instruments, mode, budget, gross, years, sweepId }),
     [instruments, mode, budget, gross, years, sweepId]);
 
-  // 蒙地卡羅只在進階模式開啟時計算，避免不必要的負擔。
-  const MC = useMemo(() => (advanced
+  // 參數化（蒙地卡羅）只在進階＋選參數化模式時計算。
+  const MC = useMemo(() => (advanced && model === "parametric"
     ? monteCarlo({ instruments, mode, budget, gross, years, sigma, paths })
     : null),
-    [advanced, instruments, mode, budget, gross, years, sigma, paths]);
+    [advanced, model, instruments, mode, budget, gross, years, sigma, paths]);
+
+  // 歷史平穩拔靴（預設模型）：借歷史波動結構，報酬以 gross 假設 recenter。
+  const BS = useMemo(() => (advanced && model === "bootstrap"
+    ? bootstrapSimulate({ instruments, mode, budget, gross, years, paths, avgBlock: 6 })
+    : null),
+    [advanced, model, instruments, mode, budget, gross, years, paths]);
+
+  // 統一給圖表用的模擬結果（兩模型 series 同形）。
+  const SIM = model === "bootstrap" ? BS : MC;
+
+  // 歷史回測校驗：用實際歷史月報酬跑滾動視窗（不抽樣、不 recenter）。
+  const BT = useMemo(() => (advanced && backtest
+    ? historicalBacktest({ mode, budget, years })
+    : null),
+    [advanced, backtest, mode, budget, years]);
+
+  // 圖表資料：把回測「最近一段實績」疊成 hist 線（與模擬機率帶同 year 對齊）。
+  const chartData = useMemo(() => {
+    if (!SIM) return null;
+    if (!BT) return SIM.series;
+    return SIM.series.map((d, idx) => ({ ...d, hist: BT.last.series[idx] ? BT.last.series[idx].total : null }));
+  }, [SIM, BT]);
 
   const allocSum = instruments.reduce((s, i) => s + num(i.alloc), 0);
 
@@ -268,7 +296,7 @@ function App() {
 
   // 設定匯出/匯入（JSON），方便備份與分享；匯入一律經 sanitizeState 清理。
   const exportConfig = () => {
-    const blob = new Blob([JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced }, null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest }, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url; a.download = "tw-cockpit-config.json"; a.click();
@@ -398,8 +426,8 @@ function App() {
         <div className="card" style={{ padding: 16, marginBottom: 12 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
             <div>
-              <div style={{ fontSize: 14, fontWeight: 700 }}>蒙地卡羅機率模擬</div>
-              <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>上方直線試算假設報酬固定；這裡改為加入波動度、跑多條隨機路徑，看結果的機率分布。</div>
+              <div style={{ fontSize: 14, fontWeight: 700 }}>機率模擬</div>
+              <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>上方直線試算假設報酬固定；這裡加入波動與隨機性，看結果的機率分布。預設用台股歷史報酬做「平穩拔靴」（含厚尾與序列報酬風險），亦可切換參數化（GBM 對數常態）。</div>
             </div>
             <button className="btn" onClick={() => setAdvanced((v) => !v)} aria-pressed={advanced}
               style={{ background: advanced ? C.ink : "#fff", color: advanced ? "#fff" : C.muted }}>
@@ -407,38 +435,79 @@ function App() {
             </button>
           </div>
 
-          {advanced && MC && (
+          {advanced && SIM && (
             <div style={{ marginTop: 14 }}>
-              <div className="grid2" style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 16, alignItems: "center", marginBottom: 12 }}>
-                <Field label={"年化波動度（標準差）— " + sigma + "%"}>
-                  <input type="range" min="0" max="40" step="1" value={sigma} onChange={(e) => setSigma(num(e.target.value))} aria-label="年化波動度標準差" style={{ accentColor: C.blue }} />
-                </Field>
+              {/* 模型切換 + 回測開關 */}
+              <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
+                {[["bootstrap", "歷史拔靴（預設）"], ["parametric", "參數化"]].map(([k, lab]) => (
+                  <button key={k} className="btn" onClick={() => setModel(k)} aria-pressed={model === k}
+                    style={{ background: model === k ? C.blue : "#fff", color: model === k ? "#fff" : C.muted, borderColor: model === k ? C.blue : C.border }}>
+                    {lab}
+                  </button>
+                ))}
+                <button className="btn" onClick={() => setBacktest((v) => !v)} aria-pressed={backtest}
+                  style={{ marginLeft: "auto", background: backtest ? C.ink : "#fff", color: backtest ? "#fff" : C.muted }}>
+                  {backtest ? "回測校驗：開" : "回測校驗：關"}
+                </button>
+              </div>
+
+              {/* 控制列：參數化才有 σ 滑桿 */}
+              <div className="grid2" style={{ display: "grid", gridTemplateColumns: model === "parametric" ? "1fr 1fr auto" : "1fr auto", gap: 16, alignItems: "center", marginBottom: 12 }}>
+                {model === "parametric" && (
+                  <Field label={"年化波動度（標準差）— " + sigma + "%"}>
+                    <input type="range" min="0" max="40" step="1" value={sigma} onChange={(e) => setSigma(num(e.target.value))} aria-label="年化波動度標準差" style={{ accentColor: C.blue }} />
+                  </Field>
+                )}
                 <Field label="模擬路徑數">
                   <select style={{ ...numInput, fontFamily: "var(--sans)" }} value={paths} onChange={(e) => setPaths(num(e.target.value, 100))} aria-label="模擬路徑數">
                     {[500, 1500, 5000].map((n) => <option key={n} value={n}>{n.toLocaleString()} 條</option>)}
                   </select>
                 </Field>
-                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5 }}>
-                  隱含幾何報酬<br /><span className="num" style={{ fontSize: 16, fontWeight: 700, color: C.ink }}>{MC.cagrImplied.toFixed(2)}%</span><br />
-                  ＝算術 {gross}% − 波動拖累 σ²/2
-                </div>
+                {model === "parametric" ? (
+                  <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5 }}>
+                    隱含幾何報酬<br /><span className="num" style={{ fontSize: 16, fontWeight: 700, color: C.ink }}>{MC.cagrImplied.toFixed(2)}%</span><br />
+                    ＝算術 {gross}% − 波動拖累 σ²/2
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5 }}>
+                    台股歷史波動結構<br />報酬已 recenter 至 <span className="num" style={{ fontWeight: 700, color: C.ink }}>{gross}%</span> 假設<br />區塊均長 6 個月
+                  </div>
+                )}
               </div>
 
-              <div className="grid2" style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 14, marginBottom: 12 }}>
-                <Stat label="中位數資產 (P50)" val={fmtWan(MC.medianFinal)} sub={"成長 " + MC.medianMultiple.toFixed(2) + "×"} color={C.red} />
-                <Stat label="樂觀 (P90)" val={fmtWan(MC.series[years].p90)} sub="前 10% 路徑" color={C.jade} />
-                <Stat label="保守 (P10)" val={fmtWan(MC.series[years].p10)} sub="後 10% 路徑" color={C.warn} />
-                <Stat label="保本機率" val={MC.aboveInvested.toFixed(0) + "%"} sub={"翻倍機率 " + MC.aboveDouble.toFixed(0) + "%"} color={C.blue} />
-              </div>
+              {/* 統計卡：兩模型不同 */}
+              {model === "parametric" ? (
+                <div className="grid2" style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 14, marginBottom: 12 }}>
+                  <Stat label="中位數資產 (P50)" val={fmtWan(MC.medianFinal)} sub={"成長 " + MC.medianMultiple.toFixed(2) + "×"} color={C.red} />
+                  <Stat label="樂觀 (P90)" val={fmtWan(MC.series[years].p90)} sub="前 10% 路徑" color={C.jade} />
+                  <Stat label="保守 (P10)" val={fmtWan(MC.series[years].p10)} sub="後 10% 路徑" color={C.warn} />
+                  <Stat label="保本機率" val={MC.aboveInvested.toFixed(0) + "%"} sub={"翻倍機率 " + MC.aboveDouble.toFixed(0) + "%"} color={C.blue} />
+                </div>
+              ) : (
+                <React.Fragment>
+                  <div className="grid2" style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 14, marginBottom: 10 }}>
+                    <Stat label="中位數資產 (P50)" val={fmtWan(BS.medianFinal)} sub={"成長 " + BS.medianMultiple.toFixed(2) + "×"} color={C.red} />
+                    <Stat label="樂觀 (P90)" val={fmtWan(BS.series[years].p90)} sub="前 10% 路徑" color={C.jade} />
+                    <Stat label="保守 (P10)" val={fmtWan(BS.series[years].p10)} sub="後 10% 路徑" color={C.warn} />
+                    <Stat label="達標率" val={(BS.risk.successRate * 100).toFixed(0) + "%"} sub="期末 ≥ 投入本金" color={C.blue} />
+                  </div>
+                  <div className="grid2" style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 14, marginBottom: 12 }}>
+                    <Stat label="最大回撤（中位）" val={(BS.risk.maxDrawdownP50 * 100).toFixed(0) + "%"} sub="一半路徑不超過此跌幅" color={C.warn} />
+                    <Stat label="最大回撤（P90，較差）" val={(BS.risk.maxDrawdownP90 * 100).toFixed(0) + "%"} sub="一成路徑跌更深" color={C.red} />
+                    <Stat label="最差 5% 期末 (CVaR)" val={fmtWan(BS.risk.cvar05)} sub="尾端風險" color={C.muted} />
+                  </div>
+                </React.Fragment>
+              )}
 
               <ResponsiveContainer width="100%" height={240}>
-                <ComposedChart data={MC.series} margin={{ left: -8, right: 6, top: 4 }}>
+                <ComposedChart data={chartData} margin={{ left: -8, right: 6, top: 4 }}>
                   <CartesianGrid stroke="#EEF1F5" vertical={false} />
                   <XAxis dataKey="year" tick={{ fontSize: 11, fill: C.muted }} tickLine={false} axisLine={{ stroke: C.border }} />
                   <YAxis tickFormatter={fmtWan} tick={{ fontSize: 10, fill: C.muted }} tickLine={false} axisLine={false} width={48} />
                   <Tooltip
                     formatter={(v, n) => {
                       if (n === "band") return [fmtWan(v[0]) + " ～ " + fmtWan(v[1]), "P10–P90 區間"];
+                      if (n === "hist") return [fmtWan(v), "歷史實績"];
                       return [fmtWan(v), n === "p50" ? "中位數" : "投入本金"];
                     }}
                     labelFormatter={(y) => "第 " + y + " 年"}
@@ -446,11 +515,21 @@ function App() {
                   <Area dataKey="band" stroke="none" fill={C.blue} fillOpacity={0.14} />
                   <Line type="monotone" dataKey="p50" stroke={C.red} strokeWidth={2.2} dot={false} />
                   <Line type="monotone" dataKey="invested" stroke={C.muted} strokeWidth={1.4} strokeDasharray="4 4" dot={false} />
+                  {BT && <Line type="monotone" dataKey="hist" stroke={C.jade} strokeWidth={2} dot={false} />}
                 </ComposedChart>
               </ResponsiveContainer>
+
+              {BT && (
+                <div style={{ fontSize: 11, color: C.muted, marginTop: 8, lineHeight: 1.6, background: "#F4F7FA", borderRadius: 8, padding: "8px 10px" }}>
+                  <b style={{ color: C.ink }}>回測校驗</b>（綠線）：台股歷史 {window.Engine.HIST_RETURNS.range}，過去 {BT.windows} 段 {years} 年滾動視窗，實際期末中位 {fmtWan(BT.p50)}（區間 {fmtWan(BT.p10)} ～ {fmtWan(BT.p90)}）。
+                  最近一段實績 {fmtWan(BT.last.finalValue)}，{(BT.last.finalValue >= SIM.series[years].p10 && BT.last.finalValue <= SIM.series[years].p90) ? "落在" : "落在外側於"}模擬 P10–P90 機率帶。
+                </div>
+              )}
+
               <div style={{ fontSize: 11, color: C.muted, marginTop: 8, lineHeight: 1.6 }}>
-                藍色帶＝{MC.paths.toLocaleString()} 條隨機路徑中 P10–P90 的範圍；紅線＝中位數，灰虛線＝投入本金。
-                波動度越大、帶越寬，代表結果越不確定。σ=0 時三條分位數會重合、回到上方直線試算。
+                {model === "bootstrap"
+                  ? "藍色帶＝歷史拔靴 " + BS.paths.toLocaleString() + " 條路徑的 P10–P90 範圍；借用台股歷史的波動、厚尾與序列相依，報酬已平移到你的毛報酬假設。紅線＝中位數，灰虛線＝投入本金。"
+                  : "藍色帶＝" + MC.paths.toLocaleString() + " 條隨機路徑中 P10–P90 的範圍；紅線＝中位數，灰虛線＝投入本金。σ=0 時三條分位數會重合、回到上方直線試算。"}
               </div>
             </div>
           )}
