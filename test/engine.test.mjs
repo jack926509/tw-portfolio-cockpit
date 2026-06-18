@@ -138,3 +138,17 @@ test('stationaryBootstrap: 保留序列相依（區塊 vs IID 對照）', () => 
   const iid = stationaryBootstrap({ pool, months: 240, paths: 30, avgBlock: 1, rng: makeRng(5) });
   assert.ok(avgLag1(block) > avgLag1(iid) + 0.2, `block ${avgLag1(block).toFixed(3)} 應顯著高於 IID ${avgLag1(iid).toFixed(3)}`);
 });
+
+/* ---------- Task 2.3：riskMetrics 風險指標 ---------- */
+
+import { riskMetrics } from '../engine.mjs';
+
+test('riskMetrics: CVaR(5%)=最差5%期末均值、達標率、回撤分位', () => {
+  const finals = [100, 200, 300, 400, 1000];
+  const paths = [[100, 150, 120, 200], [100, 50, 160]];  // 路徑1 最大回撤0.2；路徑2 最大回撤0.5
+  const m = riskMetrics(finals, paths, { target: 300, invested: 100 });
+  assert.equal(m.cvar05, 100);                       // 最差5%（n=5→取最差1筆）
+  assert.ok(Math.abs(m.successRate - 0.6) < 1e-9);   // ≥300 者 3/5
+  assert.ok(Math.abs(m.maxDrawdownP50 - 0.35) < 1e-9, `P50=${m.maxDrawdownP50}`);
+  assert.ok(Math.abs(m.maxDrawdownP90 - 0.47) < 1e-9, `P90=${m.maxDrawdownP90}`);
+});

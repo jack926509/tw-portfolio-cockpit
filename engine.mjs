@@ -173,6 +173,33 @@ export function stationaryBootstrap({ pool, months, paths, avgBlock, recenterTo 
   return out;
 }
 
+/* ---------- 風險指標：最大回撤分布 / CVaR / 達標率 ----------
+   finals：各路徑期末資產陣列；paths2D：各路徑「資產價值序列」（用來算回撤）。
+   - maxDrawdownP50/P90：各路徑最大回撤（峰到谷跌幅）的中位數與第 90 百分位（愈高愈差）。
+   - cvar05：期末最差 5%（至少 1 筆）的平均資產（Expected Shortfall）。
+   - successRate：期末 ≥ target 的比例，落在 [0,1]。                       */
+export function riskMetrics(finals, paths2D, { target, invested } = {}) {
+  const n = finals.length || 1;
+  const sortedFinals = finals.slice().sort((a, b) => a - b);
+  const k = Math.max(1, Math.floor(0.05 * n));
+  let cvarSum = 0;
+  for (let i = 0; i < k; i++) cvarSum += sortedFinals[i];
+  const cvar05 = cvarSum / k;
+  const successRate = target != null
+    ? finals.reduce((s, v) => s + (v >= target ? 1 : 0), 0) / n
+    : null;
+
+  const dd = paths2D.map((row) => {
+    let peak = -Infinity, maxDD = 0;
+    for (const v of row) { if (v > peak) peak = v; if (peak > 0) { const d = (peak - v) / peak; if (d > maxDD) maxDD = d; } }
+    return maxDD;
+  }).sort((a, b) => a - b);
+  const maxDrawdownP50 = quantile(dd, 0.50);
+  const maxDrawdownP90 = quantile(dd, 0.90);
+
+  return { maxDrawdownP50, maxDrawdownP90, cvar05, successRate, invested };
+}
+
 /* ---------- 台股歷史月報酬（含息，平穩拔靴用） ----------
    來源：FinMind TaiwanStockTotalReturnIndex（data_id=TAIEX，發行量加權股價「報酬」指數，
    股利已再投入），取每月最後交易日收盤計算月報酬。區間 2003-02..2026-05，共 280 筆。
