@@ -96,7 +96,7 @@ const fmtNT = (v) => "NT$" + Math.round(v).toLocaleString();
    dev 由上方 <script type="module"> 注入 window.Engine；正式版由 build.mjs 內聯為全域 Engine。
    引擎含 num / quantile / makeRng / gaussianPair / simulate / monteCarlo，
    皆有 test/engine.test.mjs 單元測試把關（σ=0 一致性、連續複利、GBM 對數常態等）。 */
-const { num, simulate, monteCarlo, bootstrapSimulate, historicalBacktest } = window.Engine;
+const { num, simulate, monteCarlo, bootstrapSimulate, historicalBacktest, toReal } = window.Engine;
 
 /* ---------- UI 小元件 ---------- */
 const Field = ({ label, children }) => (
@@ -131,6 +131,7 @@ const DEFAULT_STATE = {
   sweepId: "009816", sigma: 18, paths: 1500, advanced: false,
   model: "bootstrap", backtest: false,
   dist: "normal", nu: 5, rho: 0.7, cape: 0,
+  taxOn: false, divTaxRate: 28, realView: false, infl: 2,
 };
 
 /* 情境預設：一鍵套用報酬假設與參數化分布／相關設定。
@@ -183,6 +184,10 @@ function sanitizeState(d) {
     nu: Math.min(30, Math.max(3, Math.round(num(d.nu, 3)) || DEFAULT_STATE.nu)),
     rho: Math.min(1, Math.max(0, num(d.rho))),
     cape: num(d.cape),
+    taxOn: !!d.taxOn,
+    divTaxRate: num(d.divTaxRate),
+    realView: !!d.realView,
+    infl: num(d.infl),
   };
 }
 
@@ -202,6 +207,10 @@ function App() {
   const [nu, setNu] = useState(5);                   // Student-t 自由度（愈小尾愈胖）
   const [rho, setRho] = useState(0.7);               // 標的間平均相關係數（單因子等相關）
   const [cape, setCape] = useState(0);               // 台股 CAPE（席勒本益比），0＝不參考
+  const [taxOn, setTaxOn] = useState(false);         // 是否計入股利稅負（二代健保+股利稅）
+  const [divTaxRate, setDivTaxRate] = useState(28);  // 股利所得稅有效稅率%
+  const [realView, setRealView] = useState(false);   // 以實質購買力（平減通膨）顯示
+  const [infl, setInfl] = useState(2);               // 年通膨率%
   const [loaded, setLoaded] = useState(false);
   const [priceStatus, setPriceStatus] = useState(null); // {state:'loading'|'ok'|'err', msg, date}
 
@@ -211,6 +220,7 @@ function App() {
     setSigma(s.sigma); setPaths(s.paths); setAdvanced(s.advanced);
     setModel(s.model); setBacktest(s.backtest);
     setDist(s.dist); setNu(s.nu); setRho(s.rho); setCape(s.cape);
+    setTaxOn(s.taxOn); setDivTaxRate(s.divTaxRate); setRealView(s.realView); setInfl(s.infl);
   };
 
   // 套用情境預設：設定毛報酬與參數化分布／相關，並切到參數化模式方便對照。
@@ -229,12 +239,13 @@ function App() {
 
   useEffect(() => {
     if (!loaded) return;
-    try { localStorage.setItem(STORE_KEY, JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest, dist, nu, rho, cape })); }
+    try { localStorage.setItem(STORE_KEY, JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest, dist, nu, rho, cape, taxOn, divTaxRate, realView, infl })); }
     catch (e) { /* 忽略 */ }
-  }, [instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest, dist, nu, rho, cape, loaded]);
+  }, [instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest, dist, nu, rho, cape, taxOn, divTaxRate, realView, infl, loaded]);
 
-  const R = useMemo(() => simulate({ instruments, mode, budget, gross, years, sweepId }),
-    [instruments, mode, budget, gross, years, sweepId]);
+  const tax = taxOn ? { supplement: true, divTaxRate } : null;
+  const R = useMemo(() => simulate({ instruments, mode, budget, gross, years, sweepId, tax }),
+    [instruments, mode, budget, gross, years, sweepId, taxOn, divTaxRate]);
 
   // 參數化（蒙地卡羅）只在進階＋選參數化模式時計算。
   const MC = useMemo(() => (advanced && model === "parametric"
@@ -260,9 +271,14 @@ function App() {
   // 圖表資料：把回測「最近一段實績」疊成 hist 線（與模擬機率帶同 year 對齊）。
   const chartData = useMemo(() => {
     if (!SIM) return null;
-    if (!BT) return SIM.series;
-    return SIM.series.map((d, idx) => ({ ...d, hist: BT.last.series[idx] ? BT.last.series[idx].total : null }));
-  }, [SIM, BT]);
+    let s = BT
+      ? SIM.series.map((d, idx) => ({ ...d, hist: BT.last.series[idx] ? BT.last.series[idx].total : null }))
+      : SIM.series;
+    return realView ? toReal(s, { infl }) : s;
+  }, [SIM, BT, realView, infl]);
+
+  // 實質購買力平減因子（年期末）；非實質模式為 1。供統計卡的名目金額換算。
+  const realF = realView ? Math.pow(1 + num(infl) / 100, years) : 1;
 
   const allocSum = instruments.reduce((s, i) => s + num(i.alloc), 0);
 
@@ -321,7 +337,7 @@ function App() {
 
   // 設定匯出/匯入（JSON），方便備份與分享；匯入一律經 sanitizeState 清理。
   const exportConfig = () => {
-    const blob = new Blob([JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest, dist, nu, rho, cape }, null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest, dist, nu, rho, cape, taxOn, divTaxRate, realView, infl }, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url; a.download = "tw-cockpit-config.json"; a.click();
@@ -445,7 +461,24 @@ function App() {
                 {instruments.map((i) => <option key={i.id} value={i.id}>{i.name}</option>)}
               </select>
             </Field>
+            <Field label="計入股利稅負">
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <button className="btn" onClick={() => setTaxOn((v) => !v)} aria-pressed={taxOn}
+                  style={{ padding: "6px 12px", background: taxOn ? C.warn : "#fff", color: taxOn ? "#fff" : C.muted, borderColor: taxOn ? C.warn : C.border }}>
+                  {taxOn ? "開（二代健保＋股利稅）" : "關"}
+                </button>
+                <label style={{ fontSize: 11, color: C.muted, display: "flex", gap: 4, alignItems: "center" }}>
+                  股利稅率%
+                  <input className="num" type="number" min="0" step="1" value={divTaxRate} onChange={(e) => setDivTaxRate(num(e.target.value))} aria-label="股利所得稅有效稅率" disabled={!taxOn} style={{ ...numInput, width: 52, opacity: taxOn ? 1 : 0.5 }} />
+                </label>
+              </div>
+            </Field>
           </div>
+          {taxOn && (
+            <div style={{ fontSize: 11, color: C.muted, marginTop: 8, lineHeight: 1.6 }}>
+              單筆股利 ≥ NT$20,000 課二代健保補充保費 2.11%，並按上述有效稅率課股利所得稅；稅後股利才掃入再投資。此設定僅影響上方直線試算的配息標的，機率模擬採總報酬假設不另計。
+            </div>
+          )}
         </div>
 
         <div className="card" style={{ padding: 16, marginBottom: 12 }}>
@@ -470,8 +503,16 @@ function App() {
                     {lab}
                   </button>
                 ))}
+                <label style={{ marginLeft: "auto", fontSize: 11, color: C.muted, display: "flex", gap: 4, alignItems: "center" }}>
+                  通膨%
+                  <input className="num" type="number" min="0" step="0.5" value={infl} onChange={(e) => setInfl(num(e.target.value))} aria-label="年通膨率" disabled={!realView} style={{ ...numInput, width: 52, opacity: realView ? 1 : 0.5 }} />
+                </label>
+                <button className="btn" onClick={() => setRealView((v) => !v)} aria-pressed={realView}
+                  style={{ background: realView ? C.jade : "#fff", color: realView ? "#fff" : C.muted, borderColor: realView ? C.jade : C.border }}>
+                  {realView ? "實質購買力：開" : "實質購買力：關"}
+                </button>
                 <button className="btn" onClick={() => setBacktest((v) => !v)} aria-pressed={backtest}
-                  style={{ marginLeft: "auto", background: backtest ? C.ink : "#fff", color: backtest ? "#fff" : C.muted }}>
+                  style={{ background: backtest ? C.ink : "#fff", color: backtest ? "#fff" : C.muted }}>
                   {backtest ? "回測校驗：開" : "回測校驗：關"}
                 </button>
               </div>
@@ -544,23 +585,23 @@ function App() {
               {/* 統計卡：兩模型不同 */}
               {model === "parametric" ? (
                 <div className="grid2" style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 14, marginBottom: 12 }}>
-                  <Stat label="中位數資產 (P50)" val={fmtWan(MC.medianFinal)} sub={"成長 " + MC.medianMultiple.toFixed(2) + "×"} color={C.red} />
-                  <Stat label="樂觀 (P90)" val={fmtWan(MC.series[years].p90)} sub="前 10% 路徑" color={C.jade} />
-                  <Stat label="保守 (P10)" val={fmtWan(MC.series[years].p10)} sub="後 10% 路徑" color={C.warn} />
+                  <Stat label="中位數資產 (P50)" val={fmtWan(MC.medianFinal / realF)} sub={"成長 " + MC.medianMultiple.toFixed(2) + "×"} color={C.red} />
+                  <Stat label="樂觀 (P90)" val={fmtWan(MC.series[years].p90 / realF)} sub="前 10% 路徑" color={C.jade} />
+                  <Stat label="保守 (P10)" val={fmtWan(MC.series[years].p10 / realF)} sub="後 10% 路徑" color={C.warn} />
                   <Stat label="保本機率" val={MC.aboveInvested.toFixed(0) + "%"} sub={"翻倍機率 " + MC.aboveDouble.toFixed(0) + "%"} color={C.blue} />
                 </div>
               ) : (
                 <React.Fragment>
                   <div className="grid2" style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 14, marginBottom: 10 }}>
-                    <Stat label="中位數資產 (P50)" val={fmtWan(BS.medianFinal)} sub={"成長 " + BS.medianMultiple.toFixed(2) + "×"} color={C.red} />
-                    <Stat label="樂觀 (P90)" val={fmtWan(BS.series[years].p90)} sub="前 10% 路徑" color={C.jade} />
-                    <Stat label="保守 (P10)" val={fmtWan(BS.series[years].p10)} sub="後 10% 路徑" color={C.warn} />
+                    <Stat label="中位數資產 (P50)" val={fmtWan(BS.medianFinal / realF)} sub={"成長 " + BS.medianMultiple.toFixed(2) + "×"} color={C.red} />
+                    <Stat label="樂觀 (P90)" val={fmtWan(BS.series[years].p90 / realF)} sub="前 10% 路徑" color={C.jade} />
+                    <Stat label="保守 (P10)" val={fmtWan(BS.series[years].p10 / realF)} sub="後 10% 路徑" color={C.warn} />
                     <Stat label="達標率" val={(BS.risk.successRate * 100).toFixed(0) + "%"} sub="期末 ≥ 投入本金" color={C.blue} />
                   </div>
                   <div className="grid2" style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 14, marginBottom: 12 }}>
                     <Stat label="最大回撤（中位）" val={(BS.risk.maxDrawdownP50 * 100).toFixed(0) + "%"} sub="一半路徑不超過此跌幅" color={C.warn} />
                     <Stat label="最大回撤（P90，較差）" val={(BS.risk.maxDrawdownP90 * 100).toFixed(0) + "%"} sub="一成路徑跌更深" color={C.red} />
-                    <Stat label="最差 5% 期末 (CVaR)" val={fmtWan(BS.risk.cvar05)} sub="尾端風險" color={C.muted} />
+                    <Stat label="最差 5% 期末 (CVaR)" val={fmtWan(BS.risk.cvar05 / realF)} sub="尾端風險" color={C.muted} />
                   </div>
                 </React.Fragment>
               )}
@@ -596,6 +637,7 @@ function App() {
                 {model === "bootstrap"
                   ? "藍色帶＝歷史拔靴 " + BS.paths.toLocaleString() + " 條路徑的 P10–P90 範圍；借用台股歷史的波動、厚尾與序列相依，報酬已平移到你的毛報酬假設。紅線＝中位數，灰虛線＝投入本金。"
                   : "藍色帶＝" + MC.paths.toLocaleString() + " 條隨機路徑中 P10–P90 的範圍；紅線＝中位數，灰虛線＝投入本金。σ=0 時三條分位數會重合、回到上方直線試算。"}
+                {realView ? "（已以年通膨 " + infl + "% 平減為今日購買力）" : ""}
               </div>
             </div>
           )}
