@@ -1,0 +1,14 @@
+{
+  "name": "tw-portfolio-cockpit",
+  "version": "1.0.0",
+  "description": "台股配置控制台 —— 定期定額試算、穿透台積電集中度、股利掃入複利、蒙地卡羅機率模擬。單一 HTML、零安裝。",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  },
+  "license": "MIT"
+}
