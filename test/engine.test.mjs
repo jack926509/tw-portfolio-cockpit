@@ -87,6 +87,49 @@ test('monteCarlo 同種子可重現', () => {
   assert.equal(mk().medianFinal, mk().medianFinal);
 });
 
+/* ---------- Task 3.1：Student-t 抽樣（厚尾） ---------- */
+
+import { studentT } from '../engine.mjs';
+
+test('studentT: 標準化後均值≈0、標準差≈1', () => {
+  const r = makeRng(3);
+  let n = 0, s = 0, ss = 0;
+  for (let i = 0; i < 40000; i++) { const z = studentT(r, 6); n++; s += z; ss += z * z; }
+  const m = s / n, sd = Math.sqrt(ss / n - m * m);
+  assert.ok(Math.abs(m) < 0.05, `均值 ${m}`);
+  assert.ok(Math.abs(sd - 1) < 0.1, `標準差 ${sd}`);
+});
+
+test('studentT: 尾部比常態胖（極端值比例更高）', () => {
+  const r1 = makeRng(9), r2 = makeRng(9);
+  let tTail = 0, nTail = 0; const TH = 2.5, K = 40000;
+  for (let i = 0; i < K; i++) if (Math.abs(studentT(r1, 4)) > TH) tTail++;
+  for (let i = 0; i < K; i++) { const [a] = gaussianPair(r2); if (Math.abs(a) > TH) nTail++; }
+  assert.ok(tTail > nTail, `t 尾 ${tTail} 應 > 常態尾 ${nTail}`);
+});
+
+test('studentT: 超峰態為正（比常態厚尾）', () => {
+  // 厚尾的定義性檢驗：峰態 > 3（常態），且 nu=5 理論峰態=9，留充裕餘裕避免抽樣雜訊誤判。
+  const r = makeRng(21); const xs = [];
+  for (let i = 0; i < 60000; i++) xs.push(studentT(r, 5));
+  const m = xs.reduce((a, b) => a + b, 0) / xs.length;
+  let m2 = 0, m4 = 0;
+  for (const x of xs) { const d = x - m; m2 += d * d; m4 += d * d * d * d; }
+  m2 /= xs.length; m4 /= xs.length;
+  const kurt = m4 / (m2 * m2);
+  assert.ok(kurt > 3.5, `峰態 ${kurt} 應 > 3（常態厚尾門檻）`);
+});
+
+test('monteCarlo dist=t、σ=0：仍貼齊直線試算（一致性不破）', () => {
+  // t 分布只改變衝擊形狀；σ=0 時無衝擊，期末必須仍等於確定性試算（核心一致性）。
+  const args = { instruments: INST1, mode: 'lump', budget: 1000, gross: 6, years: 10 };
+  const mc = monteCarlo({ ...args, sigma: 0, dist: 't', nu: 5, paths: 100, seed: 7 });
+  const last = mc.series[10];
+  assert.ok(Math.abs(last.p10 - last.p90) < 1e-6, `p10=${last.p10} p90=${last.p90}`);
+  const det = simulate({ ...args, sweepId: 'a' });
+  assert.ok(Math.abs(last.p50 - det.finalTotal) / det.finalTotal < 1e-9, `mc=${last.p50} det=${det.finalTotal}`);
+});
+
 /* ---------- Task 2.1：HIST_RETURNS 歷史月報酬資料 ---------- */
 
 import { HIST_RETURNS } from '../engine.mjs';

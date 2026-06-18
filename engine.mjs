@@ -28,6 +28,22 @@ export function gaussianPair(rng) {
   return [r * Math.cos(th), r * Math.sin(th)];
 }
 
+/* 一個標準化 Student-t 變量（均值 0、變異數 1，厚尾）。
+   t = z / √(χ²ν/ν)，χ²ν 以 ν 個標準常態平方和取得（ν 取整數，退休模擬常用 4–8）；
+   原始 t 變異數為 ν/(ν−2)，乘 √((ν−2)/ν) 標準化，方能與常態 z 一樣直接乘上 σ。 */
+export function studentT(rng, nu) {
+  const v = Math.max(3, Math.round(nu) || 5);   // 需 ν>2 變異數才有限
+  const [z] = gaussianPair(rng);
+  let chi2 = 0;
+  for (let i = 0; i < v; i += 2) {
+    const [a, b] = gaussianPair(rng);
+    chi2 += a * a;
+    if (i + 1 < v) chi2 += b * b;
+  }
+  const t = z / Math.sqrt(chi2 / v);
+  return t * Math.sqrt((v - 2) / v);            // 標準化為單位變異數
+}
+
 /* 已排序（升冪）陣列取分位數（線性內插） */
 export function quantile(sorted, p) {
   if (!sorted.length) return 0;
@@ -101,8 +117,9 @@ export function simulate({ instruments, mode, budget, gross, years, sweepId }) {
    - 對數常態本身 ≥0，故移除舊版 factor>0?factor:0 截斷（該截斷會偏高）。
    - gross 視為算術平均年報酬，扣配置加權內扣得投組 μ；股利在投組內掃轉不離開，
      總額層級不另扣 divYield。隱含幾何報酬 cagrImplied ≈ μ − σ²/2。
-   - 接受可注入 seed，未給時以參數雜湊產生穩定種子（仍可重現）。           */
-export function monteCarlo({ instruments, mode, budget, gross, years, sigma, paths, seed }) {
+   - 接受可注入 seed，未給時以參數雜湊產生穩定種子（仍可重現）。
+   - dist='t' 時月衝擊改用標準化 Student-t（厚尾，自由度 nu），σ 意義不變。  */
+export function monteCarlo({ instruments, mode, budget, gross, years, sigma, paths, seed, dist = "normal", nu = 5 }) {
   const list = instruments;
   const sumAlloc = list.reduce((s, i) => s + num(i.alloc), 0) || 1;
   const wFee = list.reduce((s, i) => s + (num(i.alloc) / sumAlloc) * num(i.fee), 0); // 加權平均內扣
@@ -116,17 +133,19 @@ export function monteCarlo({ instruments, mode, budget, gross, years, sigma, pat
   const start = mode === "lump" ? budget : 0;
   const contrib = mode === "monthly" ? budget : 0;
   const rng = makeRng(seed != null ? seed : 1234567);
+  const useT = dist === "t";
 
   // yearVals[y] = 該年底各路徑的資產陣列，用來取分位數
   const yearVals = Array.from({ length: years + 1 }, () => new Float64Array(N));
   for (let p = 0; p < N; p++) {
     let bal = start;
     yearVals[0][p] = bal;
-    let cached = null;   // gaussianPair 一次給兩個，交替使用
+    let cached = null;   // gaussianPair 一次給兩個，交替使用（常態用）
     for (let m = 1; m <= months; m++) {
       bal += contrib;
       let z;
-      if (cached === null) { const pair = gaussianPair(rng); z = pair[0]; cached = pair[1]; }
+      if (useT) { z = studentT(rng, nu); }
+      else if (cached === null) { const pair = gaussianPair(rng); z = pair[0]; cached = pair[1]; }
       else { z = cached; cached = null; }
       bal *= Math.exp(driftM + sigM * z);   // GBM 對數常態月步進（恆 ≥0，無需截斷）
       if (m % 12 === 0) yearVals[m / 12][p] = bal;
