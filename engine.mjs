@@ -223,6 +223,40 @@ export function bootstrapSimulate({ instruments, mode, budget, gross, years, pat
   return { series, invested, medianFinal, medianMultiple: invested ? medianFinal / invested : 0, risk, paths: N };
 }
 
+/* ---------- 歷史滾動回測（校驗用） ----------
+   不抽樣、不 recenter：直接用歷史月報酬 pool 的每一段連續 years 視窗，跑實際定期定額/單筆，
+   得各視窗期末資產分布（p10/p50/p90）與最近一段視窗的逐年序列（last）。
+   用來和模擬的機率帶對照：歷史實績理應落在 P10–P90 之間。               */
+export function historicalBacktest({ pool = HIST_RETURNS.monthly, mode, budget, years }) {
+  const months = years * 12;
+  const start = mode === "lump" ? budget : 0;
+  const contrib = mode === "monthly" ? budget : 0;
+  const runWindow = (offset, keepSeries) => {
+    let bal = start;
+    const series = keepSeries ? [{ year: 0, total: bal, invested: start }] : null;
+    for (let m = 1; m <= months; m++) {
+      bal += contrib;
+      bal *= 1 + pool[offset + m - 1];
+      if (bal < 0) bal = 0;
+      if (keepSeries && m % 12 === 0) series.push({ year: m / 12, total: bal, invested: mode === "lump" ? budget : budget * m });
+    }
+    return { final: bal, series };
+  };
+  const windows = pool.length - months + 1;
+  const finals = [];
+  for (let o = 0; o < windows; o++) finals.push(runWindow(o, false).final);
+  const sorted = finals.slice().sort((a, b) => a - b);
+  const lastWin = runWindow(Math.max(0, windows - 1), true);
+  const invested = mode === "lump" ? budget : budget * months;
+  return {
+    windows: Math.max(0, windows),
+    finals,
+    p10: quantile(sorted, 0.10), p50: quantile(sorted, 0.50), p90: quantile(sorted, 0.90),
+    invested,
+    last: { finalValue: lastWin.final, series: lastWin.series },
+  };
+}
+
 /* ---------- 風險指標：最大回撤分布 / CVaR / 達標率 ----------
    finals：各路徑期末資產陣列；paths2D：各路徑「資產價值序列」（用來算回撤）。
    - maxDrawdownP50/P90：各路徑最大回撤（峰到谷跌幅）的中位數與第 90 百分位（愈高愈差）。

@@ -173,3 +173,27 @@ test('bootstrapSimulate: 期末中位數隨報酬假設提高而提高（recente
   const hi = bootstrapSimulate({ ...base, gross: 10 }).series[20].p50;
   assert.ok(hi > lo, `hi ${hi} 應 > lo ${lo}`);
 });
+
+/* ---------- Task 2.5：historicalBacktest 歷史滾動回測 ---------- */
+
+import { historicalBacktest } from '../engine.mjs';
+
+test('historicalBacktest: 零報酬池 → 單筆期末=本金、視窗數正確', () => {
+  const pool = new Array(24).fill(0);
+  const r = historicalBacktest({ pool, mode: 'lump', budget: 1000, years: 1 });
+  assert.equal(r.windows, 13);                       // 24-12+1
+  assert.equal(r.p50, 1000);
+  assert.equal(r.last.series[r.last.series.length - 1].total, 1000);
+});
+
+test('historicalBacktest: 固定正報酬池 → 單筆期末=本金·(1+r)^月數', () => {
+  const pool = new Array(24).fill(0.01);
+  const r = historicalBacktest({ pool, mode: 'lump', budget: 1000, years: 1 });
+  assert.ok(Math.abs(r.p50 - 1000 * Math.pow(1.01, 12)) < 1e-6, `p50=${r.p50}`);
+});
+
+test('historicalBacktest: 定期定額零報酬 → 期末=投入總額', () => {
+  const pool = new Array(24).fill(0);
+  const r = historicalBacktest({ pool, mode: 'monthly', budget: 100, years: 1 });
+  assert.equal(r.p50, 1200);
+});
