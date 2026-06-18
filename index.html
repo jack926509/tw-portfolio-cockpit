@@ -7,6 +7,7 @@
 <meta name="description" content="台股 ETF 與個股的定期定額累積試算、股利掃入複利目標、穿透台積電集中度分析。可自行增刪標的。" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
 <!-- 字體改用非阻塞 <link>，避免 @import 串行 render-blocking -->
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Noto+Sans+TC:wght@400;500;700&display=swap" />
 <style>
@@ -28,14 +29,30 @@
 <body>
 <div id="root"><div class="boot">載入中…（第一次會抓取 React 與圖表元件）</div></div>
 
-<!-- 相依套件：順序很重要，React 要先於 Recharts。版本已釘死至確切 patch，避免
-     unpkg 隨 major 版號漂移導致快取破損。建議另行加上 SRI integrity 雜湊以防供應鏈
-     竄改（hash 需由實際檔案產生，見 README「安全性」說明）。 -->
-<script crossorigin="anonymous" src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
-<script crossorigin="anonymous" src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
-<script crossorigin="anonymous" src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
-<script crossorigin="anonymous" src="https://unpkg.com/recharts@2.12.7/umd/Recharts.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+<script>
+  // 逾時看門狗：純 JS、不依賴 Babel。若 12 秒後 App 仍未掛載（多半是 CDN 下載過慢
+  // 或被網路／防火牆擋下），用可讀的排錯訊息取代永久「載入中…」。Babel 本身載入失敗
+  // 時，下方 type="text/babel" 區塊根本不會執行，故這個保護必須放在 Babel 之外。
+  window.__bootWatchdog = setTimeout(function () {
+    var root = document.getElementById("root");
+    if (root && root.querySelector(".boot")) {
+      root.innerHTML = '<div class="boot" style="flex-direction:column;gap:10px;text-align:center;padding:24px;max-width:520px;margin:0 auto">'
+        + '<div style="font-size:16px;font-weight:700;color:#11151C">載入逾時</div>'
+        + '<div>必要元件（React／圖表／Babel）下載過慢或被網路擋下。</div>'
+        + '<div>請確認網路後重新整理；若使用公司／校園網路或 VPN，可能擋了 CDN。</div>'
+        + '<button onclick="location.reload()" style="cursor:pointer;padding:8px 16px;border-radius:8px;border:1px solid #D6DBE4;background:#fff;font-family:inherit">重新整理</button>'
+        + '</div>';
+    }
+  }, 12000);
+</script>
+
+<!-- 相依套件：順序很重要，React 要先於 Recharts。改用 jsDelivr（多重 CDN、較穩定，
+     台灣/亞洲連線通常優於 unpkg），並釘死至確切 patch 版本。 -->
+<script src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prop-types@15.8.1/prop-types.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/recharts@2.12.7/umd/Recharts.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
 
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo } = React;
@@ -665,6 +682,7 @@ class ErrorBoundary extends React.Component {
 /* ---------- 啟動：先確認 CDN 相依都載入，失敗就給可讀訊息（取代永久「載入中…」） ---------- */
 (function boot() {
   const root = document.getElementById("root");
+  clearTimeout(window.__bootWatchdog); // 已進到啟動流程，停掉逾時看門狗
   const missing = [];
   if (typeof React === "undefined" || typeof ReactDOM === "undefined") missing.push("React");
   if (typeof Recharts === "undefined") missing.push("Recharts（圖表）");
