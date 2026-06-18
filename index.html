@@ -123,7 +123,7 @@ const fmtNT = (v) => "NT$" + Math.round(v).toLocaleString();
    dev 由上方 <script type="module"> 注入 window.Engine；正式版由 build.mjs 內聯為全域 Engine。
    引擎含 num / quantile / makeRng / gaussianPair / simulate / monteCarlo，
    皆有 test/engine.test.mjs 單元測試把關（σ=0 一致性、連續複利、GBM 對數常態等）。 */
-const { num, simulate, monteCarlo, bootstrapSimulate, historicalBacktest, toReal } = window.Engine;
+const { num, simulate, monteCarlo, bootstrapSimulate, historicalBacktest, toReal, solveContribution, toCsv } = window.Engine;
 
 /* ---------- UI 小元件 ---------- */
 const Field = ({ label, children }) => (
@@ -159,6 +159,7 @@ const DEFAULT_STATE = {
   model: "bootstrap", backtest: false,
   dist: "normal", nu: 5, rho: 0.7, cape: 0,
   taxOn: false, divTaxRate: 28, realView: false, infl: 2,
+  targetAmt: 0,
 };
 
 /* 情境預設：一鍵套用報酬假設與參數化分布／相關設定。
@@ -215,6 +216,7 @@ function sanitizeState(d) {
     divTaxRate: num(d.divTaxRate),
     realView: !!d.realView,
     infl: num(d.infl),
+    targetAmt: num(d.targetAmt),
   };
 }
 
@@ -238,6 +240,10 @@ function App() {
   const [divTaxRate, setDivTaxRate] = useState(28);  // 股利所得稅有效稅率%
   const [realView, setRealView] = useState(false);   // 以實質購買力（平減通膨）顯示
   const [infl, setInfl] = useState(2);               // 年通膨率%
+  const [targetAmt, setTargetAmt] = useState(0);     // 目標金額（回推所需投入），0＝不啟用
+  const [snapA, setSnapA] = useState(null);          // 情境比較快照 A
+  const [snapB, setSnapB] = useState(null);          // 情境比較快照 B
+  const [showDetail, setShowDetail] = useState(false); // 年度明細表是否展開
   const [loaded, setLoaded] = useState(false);
   const [priceStatus, setPriceStatus] = useState(null); // {state:'loading'|'ok'|'err', msg, date}
 
@@ -248,6 +254,7 @@ function App() {
     setModel(s.model); setBacktest(s.backtest);
     setDist(s.dist); setNu(s.nu); setRho(s.rho); setCape(s.cape);
     setTaxOn(s.taxOn); setDivTaxRate(s.divTaxRate); setRealView(s.realView); setInfl(s.infl);
+    setTargetAmt(s.targetAmt);
   };
 
   // 套用情境預設：設定毛報酬與參數化分布／相關，並切到參數化模式方便對照。
@@ -266,9 +273,9 @@ function App() {
 
   useEffect(() => {
     if (!loaded) return;
-    try { localStorage.setItem(STORE_KEY, JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest, dist, nu, rho, cape, taxOn, divTaxRate, realView, infl })); }
+    try { localStorage.setItem(STORE_KEY, JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest, dist, nu, rho, cape, taxOn, divTaxRate, realView, infl, targetAmt })); }
     catch (e) { /* 忽略 */ }
-  }, [instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest, dist, nu, rho, cape, taxOn, divTaxRate, realView, infl, loaded]);
+  }, [instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest, dist, nu, rho, cape, taxOn, divTaxRate, realView, infl, targetAmt, loaded]);
 
   const tax = taxOn ? { supplement: true, divTaxRate } : null;
   const R = useMemo(() => simulate({ instruments, mode, budget, gross, years, sweepId, tax }),
@@ -308,6 +315,29 @@ function App() {
 
   // 統一給圖表用的模擬結果（兩模型 series 同形）。
   const SIM = model === "bootstrap" ? BS : MC;
+
+  // 目標金額回推：達成 targetAmt 所需的每月（或單筆）投入。
+  const targetNeed = useMemo(() => (targetAmt > 0
+    ? solveContribution({ instruments, mode, gross, years, sweepId, target: targetAmt, tax })
+    : 0),
+    [targetAmt, instruments, mode, gross, years, sweepId, taxOn, divTaxRate]);
+
+  // 情境快照：記下目前設定與累積資產序列，供 A/B 疊圖與差異表。
+  const takeSnapshot = (label) => ({
+    label, mode, budget, gross, years,
+    finalTotal: R.finalTotal, invested: R.invested,
+    series: R.series.map((d) => ({ year: d.year, total: d.total })),
+  });
+  // A/B 比較圖資料：以年對齊兩快照的累積資產。
+  const cmpData = useMemo(() => {
+    if (!snapA || !snapB) return null;
+    const n = Math.max(snapA.series.length, snapB.series.length);
+    return Array.from({ length: n }, (_, y) => ({
+      year: y,
+      a: snapA.series[y] ? snapA.series[y].total : null,
+      b: snapB.series[y] ? snapB.series[y].total : null,
+    }));
+  }, [snapA, snapB]);
 
   // 歷史回測校驗：用實際歷史月報酬跑滾動視窗（不抽樣、不 recenter）。
   const BT = useMemo(() => (advanced && backtest
@@ -384,7 +414,7 @@ function App() {
 
   // 設定匯出/匯入（JSON），方便備份與分享；匯入一律經 sanitizeState 清理。
   const exportConfig = () => {
-    const blob = new Blob([JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest, dist, nu, rho, cape, taxOn, divTaxRate, realView, infl }, null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, model, backtest, dist, nu, rho, cape, taxOn, divTaxRate, realView, infl, targetAmt }, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url; a.download = "tw-cockpit-config.json"; a.click();
@@ -401,13 +431,21 @@ function App() {
     reader.readAsText(file);
     e.target.value = ""; // 允許重複匯入同一檔
   };
+  // 匯出年度明細 CSV（含 BOM，Excel 開中文不亂碼）。
+  const downloadCsv = () => {
+    const blob = new Blob([toCsv(R.series, instruments)], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "tw-cockpit-年度明細.csv"; a.click();
+    URL.revokeObjectURL(url);
+  };
 
   const update = (id, k, v) => setInstruments((arr) => arr.map((i) => (i.id === id ? { ...i, [k]: v } : i)));
   const addRow = () => {
     const id = "X" + Math.random().toString(36).slice(2, 6);
     setInstruments((arr) => [...arr, {
       id, name: "新標的", ticker: "", price: 100, alloc: 0, fee: 0.3,
-      divYield: 2, tsmcW: 0, distributes: true, color: PALETTE[arr.length % PALETTE.length],
+      divYield: 2, tsmcW: 0, distributes: true, sigma: 20, color: PALETTE[arr.length % PALETTE.length],
     }]);
   };
   const removeRow = (id) => setInstruments((arr) => {
@@ -686,6 +724,98 @@ function App() {
                   : "藍色帶＝" + MC.paths.toLocaleString() + " 條隨機路徑中 P10–P90 的範圍；紅線＝中位數，灰虛線＝投入本金。σ=0 時三條分位數會重合、回到上方直線試算。"}
                 {realView ? "（已以年通膨 " + infl + "% 平減為今日購買力）" : ""}
               </div>
+            </div>
+          )}
+        </div>
+
+        {/* 目標金額回推 */}
+        <div className="card" style={{ padding: 16, marginBottom: 12 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 4 }}>目標金額回推</div>
+          <div style={{ fontSize: 11, color: C.muted, marginBottom: 10 }}>輸入想在第 {years} 年達到的金額，回推目前設定下需要的{mode === "monthly" ? "每月" : "單筆"}投入。</div>
+          <div style={{ display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap" }}>
+            <label style={{ fontSize: 12, color: C.muted, display: "flex", gap: 6, alignItems: "center" }}>
+              目標金額 (NT$)
+              <input className="num" type="number" min="0" step="100000" value={targetAmt} onChange={(e) => setTargetAmt(num(e.target.value))} aria-label="目標金額" style={{ ...numInput, width: 140 }} />
+            </label>
+            {targetAmt > 0 && (
+              <div style={{ fontSize: 13 }}>
+                需{mode === "monthly" ? "每月投入" : "單筆投入"} <b className="num" style={{ fontSize: 18, color: C.red }}>{fmtNT(targetNeed)}</b>{" "}
+                <span style={{ fontSize: 11, color: C.muted }}>（年化 {gross}% 假設、{years} 年{taxOn ? "、含股利稅" : ""}）</span>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* 情境比較 A / B */}
+        <div className="card" style={{ padding: 16, marginBottom: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 8 }}>
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 700 }}>情境比較 A / B</div>
+              <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>把目前設定存成 A 或 B 兩個快照，疊圖比較累積資產與期末差異。</div>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="btn" onClick={() => setSnapA(takeSnapshot("A"))}>存為情境 A</button>
+              <button className="btn" onClick={() => setSnapB(takeSnapshot("B"))}>存為情境 B</button>
+              {(snapA || snapB) && <button className="btn" onClick={() => { setSnapA(null); setSnapB(null); }}>清除</button>}
+            </div>
+          </div>
+          {(snapA || snapB) && (
+            <div style={{ fontSize: 11, color: C.muted, marginBottom: 8, lineHeight: 1.6 }}>
+              {snapA ? "A：" + (snapA.mode === "monthly" ? "每月 " : "單筆 ") + fmtNT(snapA.budget) + "、" + snapA.gross + "%、" + snapA.years + " 年 → " + fmtWan(snapA.finalTotal) : "A：未設定"}
+              {"　｜　"}
+              {snapB ? "B：" + (snapB.mode === "monthly" ? "每月 " : "單筆 ") + fmtNT(snapB.budget) + "、" + snapB.gross + "%、" + snapB.years + " 年 → " + fmtWan(snapB.finalTotal) : "B：未設定"}
+            </div>
+          )}
+          {cmpData && (
+            <React.Fragment>
+              <ResponsiveContainer width="100%" height={220}>
+                <ComposedChart data={cmpData} margin={{ left: -8, right: 6, top: 4 }}>
+                  <CartesianGrid stroke="#EEF1F5" vertical={false} />
+                  <XAxis dataKey="year" tick={{ fontSize: 11, fill: C.muted }} tickLine={false} axisLine={{ stroke: C.border }} />
+                  <YAxis tickFormatter={fmtWan} tick={{ fontSize: 10, fill: C.muted }} tickLine={false} axisLine={false} width={48} />
+                  <Tooltip formatter={(v, n) => [fmtWan(v), n === "a" ? "情境 A" : "情境 B"]} labelFormatter={(y) => "第 " + y + " 年"} contentStyle={{ fontSize: 12, borderRadius: 8, border: "1px solid " + C.border }} />
+                  <Line type="monotone" dataKey="a" stroke={C.blue} strokeWidth={2.2} dot={false} />
+                  <Line type="monotone" dataKey="b" stroke={C.red} strokeWidth={2.2} dot={false} />
+                </ComposedChart>
+              </ResponsiveContainer>
+              <div style={{ fontSize: 12, color: C.muted, marginTop: 6 }}>
+                期末差異（B − A）：<b className="num" style={{ color: (snapB.finalTotal - snapA.finalTotal) >= 0 ? C.jade : C.red }}>{fmtWan(snapB.finalTotal - snapA.finalTotal)}</b>
+                {"，"}B 為 A 的 <b className="num">{(snapB.finalTotal / (snapA.finalTotal || 1)).toFixed(2)}</b> 倍。
+              </div>
+            </React.Fragment>
+          )}
+        </div>
+
+        {/* 年度明細 + CSV 匯出 */}
+        <div className="card" style={{ padding: 16, marginBottom: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+            <div style={{ fontSize: 14, fontWeight: 700 }}>年度明細</div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="btn" onClick={() => setShowDetail((v) => !v)} aria-pressed={showDetail}>{showDetail ? "收合表格" : "展開表格"}</button>
+              <button className="btn" onClick={downloadCsv} aria-label="匯出年度明細 CSV">匯出 CSV</button>
+            </div>
+          </div>
+          {showDetail && (
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 480 }}>
+                <thead>
+                  <tr style={{ fontSize: 10.5, color: C.muted }}>
+                    {["年", "投入本金", "累積總額", "當年掃入股利"].map((h, j) => (
+                      <th key={j} style={{ padding: "4px 8px", fontWeight: 500, textAlign: j === 0 ? "left" : "right" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {R.series.map((d) => (
+                    <tr key={d.year} style={{ borderTop: "1px solid " + C.border }}>
+                      <td className="num" style={{ padding: "4px 8px" }}>{d.year}</td>
+                      <td className="num" style={{ padding: "4px 8px", textAlign: "right" }}>{fmtNT(d.invested)}</td>
+                      <td className="num" style={{ padding: "4px 8px", textAlign: "right", fontWeight: 600 }}>{fmtNT(d.total)}</td>
+                      <td className="num" style={{ padding: "4px 8px", textAlign: "right", color: C.muted }}>{fmtNT(d.divSwept || 0)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           )}
         </div>
