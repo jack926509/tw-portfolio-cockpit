@@ -51,7 +51,7 @@ const { code: engineCode } = await build({
 }).then((r) => ({ code: r.outputFiles[0].text }));
 
 // 3) 移除 @babel/standalone 與 dev 用的 engine module，內聯引擎，再用編譯後純 JS 取代 babel 區塊
-let out = html.replace(/\s*<script src="https?:\/\/[^"]*@babel\/standalone[^"]*"><\/script>/, "");
+let out = html.replace(/\s*<script src="https?:\/\/[^"]*@babel\/standalone[^"]*"[^>]*><\/script>/, "");
 out = out.replace(/\s*<script type="module">import \* as E from "\.\/engine\.mjs";[^<]*<\/script>/, "");
 out = out.replace(babelRe, `<script>\n${engineCode}\n</script>\n<script>\n${code}</script>`);
 

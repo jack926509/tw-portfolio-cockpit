@@ -28,6 +28,8 @@ jobs:
           node-version: 20
       - name: Install deps
         run: npm install
+      - name: Test (引擎單元測試)
+        run: npm test
       - name: Build (預編譯，移除 Babel)
         run: npm run build
       - uses: actions/configure-pages@v5
