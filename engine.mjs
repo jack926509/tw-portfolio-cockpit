@@ -122,6 +122,37 @@ export function simulate({ instruments, mode, budget, gross, years, sweepId, tax
   return { series, lookTsmc, buys, finalTotal: total(), invested };
 }
 
+/* ---------- 目標金額回推 ----------
+   simulate 的期末對「投入金額」為線性（各標的金額、月扣款、股利掃入皆線性於 budget），
+   故以單位投入（budget=1）跑一次取得每元期末值，再線性回推所需投入 = target / 每元期末值。
+   回傳達成 target 所需的每月（或單筆）投入金額；target≤0 回 0。            */
+export function solveContribution({ instruments, mode, gross, years, sweepId, target, tax = null }) {
+  const t = Math.max(0, +target || 0);
+  if (t === 0) return 0;
+  const perUnit = simulate({ instruments, mode, budget: 1, gross, years, sweepId, tax }).finalTotal;
+  return perUnit > 0 ? t / perUnit : 0;
+}
+
+/* ---------- 年度明細匯出 CSV（UTF-8 BOM，Excel 開中文不亂碼） ----------
+   依 series 內實際存在的欄位輸出（year/invested/total/p10/p50/p90/divSwept），
+   並附上各標的當年餘額欄（以 instruments 的 name 為標頭）。數值四捨五入到整數。 */
+export function toCsv(series, instruments = []) {
+  const BOM = "﻿";
+  const has = (k) => series.some((r) => typeof r[k] === "number");
+  const cols = [["year", "年"]];
+  for (const [k, label] of [["invested", "投入本金"], ["total", "累積總額"], ["p10", "P10（保守）"], ["p50", "P50（中位）"], ["p90", "P90（樂觀）"], ["divSwept", "當年掃入股利"]]) {
+    if (has(k)) cols.push([k, label]);
+  }
+  for (const i of instruments) if (has(i.id)) cols.push([i.id, i.name]);
+  const esc = (v) => { const s = String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  const header = cols.map((c) => esc(c[1])).join(",");
+  const rows = series.map((r) => cols.map((c) => {
+    const v = r[c[0]];
+    return esc(typeof v === "number" ? Math.round(v) : (v == null ? "" : v));
+  }).join(","));
+  return BOM + [header].concat(rows).join("\n");
+}
+
 /* ---------- 蒙地卡羅引擎（逐標的、單因子等相關、GBM 對數常態） ----------
    每檔月衝擊 ε_i = σ_i/√12 ·(√ρ·z0 + √(1−ρ)·z_i)，z0 為共同（市場）因子、z_i 為個股獨立因子；
    任兩檔相關係數恆為 ρ（等相關）。月 factor_i = exp((μ_i−σ_i²/2)/12 + ε_i)。
