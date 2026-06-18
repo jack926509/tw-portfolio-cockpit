@@ -7,8 +7,9 @@
 <meta name="description" content="台股 ETF 與個股的定期定額累積試算、股利掃入複利目標、穿透台積電集中度分析。可自行增刪標的。" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<!-- 字體改用非阻塞 <link>，避免 @import 串行 render-blocking -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Noto+Sans+TC:wght@400;500;700&display=swap" />
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Noto+Sans+TC:wght@400;500;700&display=swap');
   :root{ --mono:'JetBrains Mono',ui-monospace,monospace; --sans:'Noto Sans TC',system-ui,sans-serif; }
   *{box-sizing:border-box}
   html,body{margin:0;height:100%;background:#E8EBF0}
@@ -27,12 +28,14 @@
 <body>
 <div id="root"><div class="boot">載入中…（第一次會抓取 React 與圖表元件）</div></div>
 
-<!-- 相依套件：順序很重要，React 要先於 Recharts -->
-<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/prop-types@15/prop-types.min.js"></script>
-<script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<!-- 相依套件：順序很重要，React 要先於 Recharts。版本已釘死至確切 patch，避免
+     unpkg 隨 major 版號漂移導致快取破損。建議另行加上 SRI integrity 雜湊以防供應鏈
+     竄改（hash 需由實際檔案產生，見 README「安全性」說明）。 -->
+<script crossorigin="anonymous" src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin="anonymous" src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script crossorigin="anonymous" src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+<script crossorigin="anonymous" src="https://unpkg.com/recharts@2.12.7/umd/Recharts.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
 
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo } = React;
@@ -66,6 +69,25 @@ const DEFAULTS = [
 const fmtWan = (v) => (v / 10000).toFixed(v >= 1e6 ? 0 : 1) + "萬";
 const fmtNT = (v) => "NT$" + Math.round(v).toLocaleString();
 
+/* ---------- 數值清理：空白/非數字一律回退，並夾在下限以上 ---------- */
+const num = (v, min = 0) => { const n = +v; return Number.isFinite(n) ? Math.max(min, n) : min; };
+
+/* ---------- 常態亂數（Box–Muller），給蒙地卡羅抽樣 ---------- */
+function randNorm() {
+  let u = 0, v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+/* 已排序陣列取分位數（線性內插） */
+function quantile(sorted, p) {
+  if (!sorted.length) return 0;
+  const idx = (sorted.length - 1) * p;
+  const lo = Math.floor(idx), hi = Math.ceil(idx);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+}
+
 /* ---------- 試算引擎 ---------- */
 function simulate({ instruments, mode, budget, gross, years, sweepId }) {
   const list = instruments;
@@ -81,6 +103,10 @@ function simulate({ instruments, mode, budget, gross, years, sweepId }) {
     return gross - i.fee;
   };
 
+  // 每檔月成長率只與輸入有關，預先算好，避免每月重複呼叫 pow（第 m 月迴圈內）。
+  const monthly = {};
+  list.forEach((i) => (monthly[i.id] = mrate(netRate(i))));
+
   const bal = {};
   list.forEach((i) => (bal[i.id] = mode === "lump" ? amt[i.id] : 0));
   const months = years * 12;
@@ -93,7 +119,7 @@ function simulate({ instruments, mode, budget, gross, years, sweepId }) {
   for (let m = 1; m <= months; m++) {
     list.forEach((i) => {
       if (mode === "monthly") bal[i.id] += amt[i.id];
-      bal[i.id] *= 1 + mrate(netRate(i));
+      bal[i.id] *= 1 + monthly[i.id];
     });
     if (mode === "monthly") invested += budget;
     if (m % 12 === 0) {
@@ -116,6 +142,55 @@ function simulate({ instruments, mode, budget, gross, years, sweepId }) {
     return { ...i, amount: a, shares: sh, cost: sh * i.price, leftover: a - sh * i.price };
   });
   return { series, lookTsmc, buys, finalTotal: total(), invested };
+}
+
+/* ---------- 蒙地卡羅引擎（投組總額層級） ----------
+   確定性 simulate 用「單一報酬、直線複利」；這裡改為每月從常態分布抽報酬，
+   跑 N 條路徑，輸出各年 P10/P50/P90 機率帶與達標機率。
+   - gross 視為「算術平均」年報酬；扣掉配置加權平均內扣得到投組淨報酬 μ。
+   - 股利在投組內部掃轉（配息標的→複利目標）不離開投組，故總額層級不需扣 divYield。
+   - 隱含幾何（CAGR）報酬 ≈ μ − σ²/2（波動拖累），於 UI 透明顯示。            */
+function monteCarlo({ instruments, mode, budget, gross, years, sigma, paths }) {
+  const list = instruments;
+  const sumAlloc = list.reduce((s, i) => s + num(i.alloc), 0) || 1;
+  const wFee = list.reduce((s, i) => s + (num(i.alloc) / sumAlloc) * num(i.fee), 0); // 加權平均內扣
+  const muAnnual = (gross - wFee) / 100;          // 投組算術年報酬（小數）
+  const sigAnnual = num(sigma) / 100;
+  const muM = muAnnual / 12;
+  const sigM = sigAnnual / Math.sqrt(12);
+  const months = years * 12;
+  const N = Math.max(1, Math.round(paths));
+
+  const start = mode === "lump" ? budget : 0;
+  const contrib = mode === "monthly" ? budget : 0;
+
+  // yearVals[y] = 該年底各路徑的資產陣列，用來取分位數
+  const yearVals = Array.from({ length: years + 1 }, () => new Float64Array(N));
+  for (let p = 0; p < N; p++) {
+    let bal = start;
+    yearVals[0][p] = bal;
+    for (let m = 1; m <= months; m++) {
+      bal += contrib;
+      const factor = 1 + muM + sigM * randNorm();
+      bal *= factor > 0 ? factor : 0;            // 護欄：月報酬不可低於 -100%
+      if (m % 12 === 0) yearVals[m / 12][p] = bal;
+    }
+  }
+
+  const invested = mode === "lump" ? budget : budget * months;
+  const series = yearVals.map((arr, y) => {
+    const sorted = Float64Array.prototype.slice.call(arr).sort();
+    const p10 = quantile(sorted, 0.10), p50 = quantile(sorted, 0.50), p90 = quantile(sorted, 0.90);
+    // band 為 [低, 高] 兩元素陣列，Recharts Area 會渲染成 P10–P90 機率帶
+    return { year: y, p10, p50, p90, band: [p10, p90], invested: mode === "lump" ? budget : budget * y * 12 };
+  });
+  const finals = Float64Array.prototype.slice.call(yearVals[years]).sort();
+  const medianFinal = quantile(finals, 0.50);
+  const aboveInvested = (yearVals[years].reduce((s, v) => s + (v >= invested ? 1 : 0), 0) / N) * 100;
+  const aboveDouble = (yearVals[years].reduce((s, v) => s + (v >= invested * 2 ? 1 : 0), 0) / N) * 100;
+  const cagrImplied = (muAnnual - (sigAnnual * sigAnnual) / 2) * 100; // 波動拖累後的幾何年報酬
+
+  return { series, invested, medianFinal, medianMultiple: invested ? medianFinal / invested : 0, aboveInvested, aboveDouble, cagrImplied, paths: N };
 }
 
 /* ---------- UI 小元件 ---------- */
@@ -141,6 +216,54 @@ function Stat({ label, val, sub, color }) {
 
 const STORE_KEY = "tw_cockpit_v1";
 
+/* 單一標的的欄位模板：載入舊資料時用來補齊新增欄位、清理型別 */
+const INSTRUMENT_DEFAULT = {
+  id: "", name: "新標的", ticker: "", price: 100, alloc: 0, fee: 0.3,
+  divYield: 2, tsmcW: 0, distributes: true, color: PALETTE[0],
+};
+const DEFAULT_STATE = {
+  instruments: DEFAULTS, mode: "monthly", budget: 15000, gross: 7, years: 20,
+  sweepId: "009816", sigma: 18, paths: 1500, advanced: false,
+};
+
+/* 把任意（可能是舊版／殘缺）的 parsed 物件清成合法 state，缺漏一律回退預設。
+   避免舊 localStorage 缺欄位造成 undefined → NaN 汙染整個試算。 */
+function sanitizeState(d) {
+  if (!d || typeof d !== "object") return { ...DEFAULT_STATE };
+  const arr = Array.isArray(d.instruments) ? d.instruments : [];
+  const instruments = arr
+    .filter((i) => i && (i.id != null))
+    .map((i, idx) => ({
+      ...INSTRUMENT_DEFAULT,
+      ...i,
+      id: String(i.id),
+      name: i.name != null ? String(i.name) : INSTRUMENT_DEFAULT.name,
+      ticker: i.ticker != null ? String(i.ticker) : "",
+      // 缺欄位 → 回退模板預設；存在但非數字 → num() 夾成 0，皆不產生 NaN
+      price: num(i.price ?? INSTRUMENT_DEFAULT.price),
+      alloc: num(i.alloc ?? INSTRUMENT_DEFAULT.alloc),
+      fee: num(i.fee ?? INSTRUMENT_DEFAULT.fee),
+      divYield: num(i.divYield ?? INSTRUMENT_DEFAULT.divYield),
+      tsmcW: num(i.tsmcW ?? INSTRUMENT_DEFAULT.tsmcW),
+      distributes: i.distributes != null ? !!i.distributes : INSTRUMENT_DEFAULT.distributes,
+      color: i.color || PALETTE[idx % PALETTE.length],
+    }));
+  const safeInstruments = instruments.length ? instruments : DEFAULTS;
+  const mode = d.mode === "lump" ? "lump" : "monthly";
+  const sweepId = safeInstruments.some((i) => i.id === d.sweepId) ? d.sweepId : safeInstruments[0].id;
+  return {
+    instruments: safeInstruments,
+    mode,
+    budget: num(d.budget),
+    gross: num(d.gross),
+    years: Math.max(1, Math.round(num(d.years, 1)) || DEFAULT_STATE.years),
+    sweepId,
+    sigma: num(d.sigma),
+    paths: Math.min(20000, Math.max(100, Math.round(num(d.paths, 100)) || DEFAULT_STATE.paths)),
+    advanced: !!d.advanced,
+  };
+}
+
 function App() {
   const [instruments, setInstruments] = useState(DEFAULTS);
   const [mode, setMode] = useState("monthly");
@@ -148,32 +271,93 @@ function App() {
   const [gross, setGross] = useState(7);
   const [years, setYears] = useState(20);
   const [sweepId, setSweepId] = useState("009816");
+  const [sigma, setSigma] = useState(18);
+  const [paths, setPaths] = useState(1500);
+  const [advanced, setAdvanced] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [priceStatus, setPriceStatus] = useState(null); // {state:'loading'|'ok'|'err', msg, date}
+
+  const applyState = (s) => {
+    setInstruments(s.instruments); setMode(s.mode); setBudget(s.budget);
+    setGross(s.gross); setYears(s.years); setSweepId(s.sweepId);
+    setSigma(s.sigma); setPaths(s.paths); setAdvanced(s.advanced);
+  };
 
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORE_KEY);
-      if (raw) {
-        const d = JSON.parse(raw);
-        if (d.instruments && d.instruments.length) {
-          setInstruments(d.instruments); setMode(d.mode); setBudget(d.budget);
-          setGross(d.gross); setYears(d.years); setSweepId(d.sweepId);
-        }
-      }
+      if (raw) applyState(sanitizeState(JSON.parse(raw)));
     } catch (e) { /* 用預設 */ }
     setLoaded(true);
   }, []);
 
   useEffect(() => {
     if (!loaded) return;
-    try { localStorage.setItem(STORE_KEY, JSON.stringify({ instruments, mode, budget, gross, years, sweepId })); }
+    try { localStorage.setItem(STORE_KEY, JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced })); }
     catch (e) { /* 忽略 */ }
-  }, [instruments, mode, budget, gross, years, sweepId, loaded]);
+  }, [instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced, loaded]);
 
   const R = useMemo(() => simulate({ instruments, mode, budget, gross, years, sweepId }),
     [instruments, mode, budget, gross, years, sweepId]);
 
-  const allocSum = instruments.reduce((s, i) => s + (+i.alloc || 0), 0);
+  // 蒙地卡羅只在進階模式開啟時計算，避免不必要的負擔。
+  const MC = useMemo(() => (advanced
+    ? monteCarlo({ instruments, mode, budget, gross, years, sigma, paths })
+    : null),
+    [advanced, instruments, mode, budget, gross, years, sigma, paths]);
+
+  const allocSum = instruments.reduce((s, i) => s + num(i.alloc), 0);
+
+  // 抓最新收盤價：證交所 OpenAPI，免金鑰、單次回傳全市場上市個股（含 ETF）。
+  const fetchPrices = async () => {
+    setPriceStatus({ state: "loading" });
+    try {
+      const res = await fetch("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL");
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const rows = await res.json();
+      const map = {};
+      let dataDate = "";
+      const parsePrice = (v) => num(String(v == null ? "" : v).replace(/,/g, "")); // 去除千分位逗號
+      rows.forEach((r) => {
+        if (r.Code) map[String(r.Code).trim()] = parsePrice(r.ClosingPrice);
+        if (r.Date && !dataDate) dataDate = String(r.Date);
+      });
+      let hit = 0, miss = [];
+      setInstruments((arr) => arr.map((i) => {
+        const key = String(i.ticker || "").trim();
+        const p = map[key];
+        if (key && Number.isFinite(p) && p > 0) { hit++; return { ...i, price: p }; }
+        if (key) miss.push(key);
+        return i;
+      }));
+      setPriceStatus({
+        state: "ok", date: dataDate,
+        msg: "已更新 " + hit + " 檔" + (miss.length ? "，查無：" + miss.join("、") + "（上櫃股或代號不在上市清單）" : ""),
+      });
+    } catch (e) {
+      setPriceStatus({ state: "err", msg: "抓取失敗（可能為跨域 CORS 限制或暫時無法連線），可改手動填入。" });
+    }
+  };
+
+  // 設定匯出/匯入（JSON），方便備份與分享；匯入一律經 sanitizeState 清理。
+  const exportConfig = () => {
+    const blob = new Blob([JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, advanced }, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "tw-cockpit-config.json"; a.click();
+    URL.revokeObjectURL(url);
+  };
+  const importConfig = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try { applyState(sanitizeState(JSON.parse(reader.result))); }
+      catch (err) { alert("匯入失敗：檔案不是有效的設定 JSON。"); }
+    };
+    reader.readAsText(file);
+    e.target.value = ""; // 允許重複匯入同一檔
+  };
 
   const update = (id, k, v) => setInstruments((arr) => arr.map((i) => (i.id === id ? { ...i, [k]: v } : i)));
   const addRow = () => {
@@ -189,8 +373,8 @@ function App() {
     return next;
   });
   const reset = () => {
-    setInstruments(DEFAULTS); setMode("monthly"); setBudget(15000);
-    setGross(7); setYears(20); setSweepId("009816");
+    if (!window.confirm("確定要清除目前所有設定並還原預設值嗎？此動作無法復原。")) return;
+    applyState({ ...DEFAULT_STATE });
   };
 
   const zone = R.lookTsmc >= 55 ? { label: "過度集中", color: C.red }
@@ -208,7 +392,14 @@ function App() {
             <div style={{ fontSize: 22, fontWeight: 700, letterSpacing: "-.01em" }}>台股配置控制台</div>
             <div style={{ fontSize: 12.5, color: C.muted, marginTop: 2 }}>定期定額試算 · 穿透集中度 · 股利全掃複利目標</div>
           </div>
-          <button className="btn" onClick={reset}><RotateCcw size={14} /> 重設預設</button>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button className="btn" onClick={exportConfig} aria-label="匯出設定為 JSON 檔">匯出</button>
+            <label className="btn" style={{ margin: 0 }}>
+              匯入
+              <input type="file" accept="application/json,.json" onChange={importConfig} aria-label="匯入設定 JSON 檔" style={{ display: "none" }} />
+            </label>
+            <button className="btn" onClick={reset} aria-label="重設為預設值"><RotateCcw size={14} /> 重設預設</button>
+          </div>
         </div>
 
         <div className="grid2" style={{ display: "grid", gridTemplateColumns: "1.1fr 1fr", gap: 12, marginBottom: 12 }}>
@@ -253,8 +444,8 @@ function App() {
               </div>
             </Field>
             <Field label={mode === "monthly" ? "每月金額" : "單筆金額"}>
-              <input className="num" style={{ ...numInput, width: 120 }} type="number" value={budget}
-                onChange={(e) => setBudget(Math.max(0, +e.target.value))} />
+              <input className="num" aria-label={mode === "monthly" ? "每月金額" : "單筆金額"} style={{ ...numInput, width: 120 }} type="number" min="0" value={budget}
+                onChange={(e) => setBudget(num(e.target.value))} />
             </Field>
             <Field label={"年化報酬假設 — " + gross + "%"}>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -278,15 +469,82 @@ function App() {
         </div>
 
         <div className="card" style={{ padding: 16, marginBottom: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 700 }}>蒙地卡羅機率模擬</div>
+              <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>上方直線試算假設報酬固定；這裡改為加入波動度、跑多條隨機路徑，看結果的機率分布。</div>
+            </div>
+            <button className="btn" onClick={() => setAdvanced((v) => !v)} aria-pressed={advanced}
+              style={{ background: advanced ? C.ink : "#fff", color: advanced ? "#fff" : C.muted }}>
+              {advanced ? "進階模式：開" : "進階模式：關"}
+            </button>
+          </div>
+
+          {advanced && MC && (
+            <div style={{ marginTop: 14 }}>
+              <div className="grid2" style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 16, alignItems: "center", marginBottom: 12 }}>
+                <Field label={"年化波動度（標準差）— " + sigma + "%"}>
+                  <input type="range" min="0" max="40" step="1" value={sigma} onChange={(e) => setSigma(num(e.target.value))} aria-label="年化波動度標準差" style={{ accentColor: C.blue }} />
+                </Field>
+                <Field label="模擬路徑數">
+                  <select style={{ ...numInput, fontFamily: "var(--sans)" }} value={paths} onChange={(e) => setPaths(num(e.target.value, 100))} aria-label="模擬路徑數">
+                    {[500, 1500, 5000].map((n) => <option key={n} value={n}>{n.toLocaleString()} 條</option>)}
+                  </select>
+                </Field>
+                <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.5 }}>
+                  隱含幾何報酬<br /><span className="num" style={{ fontSize: 16, fontWeight: 700, color: C.ink }}>{MC.cagrImplied.toFixed(2)}%</span><br />
+                  ＝算術 {gross}% − 波動拖累 σ²/2
+                </div>
+              </div>
+
+              <div className="grid2" style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 14, marginBottom: 12 }}>
+                <Stat label="中位數資產 (P50)" val={fmtWan(MC.medianFinal)} sub={"成長 " + MC.medianMultiple.toFixed(2) + "×"} color={C.red} />
+                <Stat label="樂觀 (P90)" val={fmtWan(MC.series[years].p90)} sub="前 10% 路徑" color={C.jade} />
+                <Stat label="保守 (P10)" val={fmtWan(MC.series[years].p10)} sub="後 10% 路徑" color={C.warn} />
+                <Stat label="保本機率" val={MC.aboveInvested.toFixed(0) + "%"} sub={"翻倍機率 " + MC.aboveDouble.toFixed(0) + "%"} color={C.blue} />
+              </div>
+
+              <ResponsiveContainer width="100%" height={240}>
+                <ComposedChart data={MC.series} margin={{ left: -8, right: 6, top: 4 }}>
+                  <CartesianGrid stroke="#EEF1F5" vertical={false} />
+                  <XAxis dataKey="year" tick={{ fontSize: 11, fill: C.muted }} tickLine={false} axisLine={{ stroke: C.border }} />
+                  <YAxis tickFormatter={fmtWan} tick={{ fontSize: 10, fill: C.muted }} tickLine={false} axisLine={false} width={48} />
+                  <Tooltip
+                    formatter={(v, n) => {
+                      if (n === "band") return [fmtWan(v[0]) + " ～ " + fmtWan(v[1]), "P10–P90 區間"];
+                      return [fmtWan(v), n === "p50" ? "中位數" : "投入本金"];
+                    }}
+                    labelFormatter={(y) => "第 " + y + " 年"}
+                    contentStyle={{ fontSize: 12, borderRadius: 8, border: "1px solid " + C.border }} />
+                  <Area dataKey="band" stroke="none" fill={C.blue} fillOpacity={0.14} />
+                  <Line type="monotone" dataKey="p50" stroke={C.red} strokeWidth={2.2} dot={false} />
+                  <Line type="monotone" dataKey="invested" stroke={C.muted} strokeWidth={1.4} strokeDasharray="4 4" dot={false} />
+                </ComposedChart>
+              </ResponsiveContainer>
+              <div style={{ fontSize: 11, color: C.muted, marginTop: 8, lineHeight: 1.6 }}>
+                藍色帶＝{MC.paths.toLocaleString()} 條隨機路徑中 P10–P90 的範圍；紅線＝中位數，灰虛線＝投入本金。
+                波動度越大、帶越寬，代表結果越不確定。σ=0 時三條分位數會重合、回到上方直線試算。
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="card" style={{ padding: 16, marginBottom: 12 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
             <div style={{ fontSize: 14, fontWeight: 700 }}>標的與配置</div>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <span className="num" style={{ fontSize: 12, color: Math.round(allocSum) === 100 ? C.jade : C.warn }}>
                 配置合計 {allocSum.toFixed(0)}%{Math.round(allocSum) !== 100 ? "（將自動正規化）" : ""}
               </span>
-              <button className="btn" onClick={addRow}><Plus size={14} /> 新增標的</button>
+              <button className="btn" onClick={fetchPrices} disabled={priceStatus && priceStatus.state === "loading"} aria-label="從證交所更新最新收盤價"><Coins size={14} /> {priceStatus && priceStatus.state === "loading" ? "更新中…" : "更新股價"}</button>
+              <button className="btn" onClick={addRow} aria-label="新增一檔標的"><Plus size={14} /> 新增標的</button>
             </div>
           </div>
+          {priceStatus && priceStatus.state !== "loading" && (
+            <div style={{ fontSize: 11, marginBottom: 8, color: priceStatus.state === "err" ? C.red : C.jade }}>
+              {priceStatus.msg}{priceStatus.date ? "（資料日期 " + priceStatus.date + "）" : ""} · 僅上市最近收盤價、非盤中即時
+            </div>
+          )}
 
           <div style={{ overflowX: "auto" }}>
             <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 720 }}>
@@ -303,20 +561,20 @@ function App() {
                     <td style={{ padding: "6px" }}><span style={{ display: "inline-block", width: 10, height: 10, borderRadius: 3, background: b.color }} /></td>
                     <td style={{ padding: "6px" }}><input style={{ ...numInput, fontFamily: "var(--sans)", width: 120 }} value={b.name} onChange={(e) => update(b.id, "name", e.target.value)} /></td>
                     <td style={{ padding: "6px" }}><input style={{ ...numInput, width: 72 }} value={b.ticker} onChange={(e) => update(b.id, "ticker", e.target.value)} /></td>
-                    <td style={{ padding: "6px" }}><input className="num" style={{ ...numInput, width: 72 }} type="number" value={b.price} onChange={(e) => update(b.id, "price", +e.target.value)} /></td>
-                    <td style={{ padding: "6px" }}><input className="num" style={{ ...numInput, width: 58 }} type="number" value={b.alloc} onChange={(e) => update(b.id, "alloc", +e.target.value)} /></td>
-                    <td style={{ padding: "6px" }}><input className="num" style={{ ...numInput, width: 56 }} type="number" step="0.01" value={b.fee} onChange={(e) => update(b.id, "fee", +e.target.value)} /></td>
-                    <td style={{ padding: "6px" }}><input className="num" style={{ ...numInput, width: 56 }} type="number" step="0.1" value={b.divYield} onChange={(e) => update(b.id, "divYield", +e.target.value)} /></td>
-                    <td style={{ padding: "6px" }}><input className="num" style={{ ...numInput, width: 58 }} type="number" step="0.5" value={b.tsmcW} onChange={(e) => update(b.id, "tsmcW", +e.target.value)} /></td>
+                    <td style={{ padding: "6px" }}><input className="num" aria-label={b.name + " 股價"} style={{ ...numInput, width: 72 }} type="number" min="0" value={b.price} onChange={(e) => update(b.id, "price", num(e.target.value))} /></td>
+                    <td style={{ padding: "6px" }}><input className="num" aria-label={b.name + " 配置%"} style={{ ...numInput, width: 58 }} type="number" min="0" value={b.alloc} onChange={(e) => update(b.id, "alloc", num(e.target.value))} /></td>
+                    <td style={{ padding: "6px" }}><input className="num" aria-label={b.name + " 內扣%"} style={{ ...numInput, width: 56 }} type="number" min="0" step="0.01" value={b.fee} onChange={(e) => update(b.id, "fee", num(e.target.value))} /></td>
+                    <td style={{ padding: "6px" }}><input className="num" aria-label={b.name + " 現金殖利%"} style={{ ...numInput, width: 56 }} type="number" min="0" step="0.1" value={b.divYield} onChange={(e) => update(b.id, "divYield", num(e.target.value))} /></td>
+                    <td style={{ padding: "6px" }}><input className="num" aria-label={b.name + " 台積權重%"} style={{ ...numInput, width: 58 }} type="number" min="0" step="0.5" value={b.tsmcW} onChange={(e) => update(b.id, "tsmcW", num(e.target.value))} /></td>
                     <td style={{ padding: "6px", textAlign: "center" }}>
-                      <input type="checkbox" checked={b.distributes} onChange={(e) => update(b.id, "distributes", e.target.checked)} style={{ accentColor: C.jade, width: 16, height: 16 }} />
+                      <input type="checkbox" aria-label={b.name + " 是否配息"} checked={b.distributes} onChange={(e) => update(b.id, "distributes", e.target.checked)} style={{ accentColor: C.jade, width: 16, height: 16 }} />
                     </td>
                     <td className="num" style={{ padding: "6px", fontSize: 12.5 }}>
                       <div style={{ fontWeight: 600 }}>{b.shares.toLocaleString()} 股</div>
                       <div style={{ fontSize: 10.5, color: C.muted }}>{fmtNT(b.cost)}</div>
                     </td>
                     <td style={{ padding: "6px" }}>
-                      <button onClick={() => removeRow(b.id)} title="刪除" style={{ border: "none", background: "none", cursor: "pointer", color: C.muted, padding: 4 }}><Trash2 size={15} /></button>
+                      <button onClick={() => removeRow(b.id)} title="刪除" aria-label={"刪除 " + b.name} style={{ border: "none", background: "none", cursor: "pointer", color: C.muted, padding: 4 }}><Trash2 size={15} /></button>
                     </td>
                   </tr>
                 ))}
@@ -386,7 +644,42 @@ function App() {
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+/* ---------- 錯誤邊界：render 出錯時顯示訊息，避免整頁空白 ---------- */
+class ErrorBoundary extends React.Component {
+  constructor(p) { super(p); this.state = { err: null }; }
+  static getDerivedStateFromError(err) { return { err }; }
+  render() {
+    if (this.state.err) {
+      return (
+        <div style={{ fontFamily: "var(--sans)", color: "#11151C", padding: 24, maxWidth: 640, margin: "40px auto" }}>
+          <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>發生未預期的錯誤</div>
+          <div style={{ fontSize: 13, color: "#6B7480", marginBottom: 12 }}>試算畫面無法繼續顯示。你的設定仍保存在瀏覽器中，可重新整理再試。</div>
+          <pre style={{ fontSize: 12, background: "#F2F4F8", padding: 12, borderRadius: 8, overflow: "auto" }}>{String(this.state.err && this.state.err.message || this.state.err)}</pre>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+/* ---------- 啟動：先確認 CDN 相依都載入，失敗就給可讀訊息（取代永久「載入中…」） ---------- */
+(function boot() {
+  const root = document.getElementById("root");
+  const missing = [];
+  if (typeof React === "undefined" || typeof ReactDOM === "undefined") missing.push("React");
+  if (typeof Recharts === "undefined") missing.push("Recharts（圖表）");
+  if (missing.length) {
+    root.innerHTML = '<div class="boot" style="flex-direction:column;gap:8px;text-align:center;padding:24px">'
+      + '<div style="font-size:16px;font-weight:700;color:#11151C">無法載入必要元件：' + missing.join("、") + '</div>'
+      + '<div>請確認網路連線後重新整理。本工具首次開啟需連網下載 React 與圖表元件。</div></div>';
+    return;
+  }
+  try {
+    ReactDOM.createRoot(root).render(<ErrorBoundary><App /></ErrorBoundary>);
+  } catch (e) {
+    root.innerHTML = '<div class="boot">啟動失敗：' + String(e && e.message || e) + '</div>';
+  }
+})();
 </script>
 </body>
 </html>
