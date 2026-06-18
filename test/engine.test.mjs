@@ -130,6 +130,28 @@ test('monteCarlo dist=t、σ=0：仍貼齊直線試算（一致性不破）', ()
   assert.ok(Math.abs(last.p50 - det.finalTotal) / det.finalTotal < 1e-9, `mc=${last.p50} det=${det.finalTotal}`);
 });
 
+/* ---------- Task 3.2：個股 σ + 單因子等相關 ---------- */
+
+test('monteCarlo 單因子相關：ρ=0 分散降波動（機率帶比 ρ=1 窄）', () => {
+  // 兩檔等權、各年化波動 30%：ρ=1 投組波動≈30%；ρ=0 分散後≈21%。期末機率帶應明顯變窄。
+  const two = [
+    { id: 'a', ticker: 'a', price: 10, alloc: 50, fee: 0, divYield: 0, tsmcW: 0, distributes: false, sigma: 30 },
+    { id: 'b', ticker: 'b', price: 10, alloc: 50, fee: 0, divYield: 0, tsmcW: 0, distributes: false, sigma: 30 },
+  ];
+  const base = { instruments: two, mode: 'lump', budget: 1000, gross: 6, years: 20, paths: 2000, seed: 11 };
+  const wide = monteCarlo({ ...base, rho: 1 }).series[20];
+  const narrow = monteCarlo({ ...base, rho: 0 }).series[20];
+  // 用尺度無關的 P90/P10 比值（僅依波動、漂移相消），避免中位數位移干擾絕對帶寬比較。
+  const ratio = (s) => s.p90 / s.p10;
+  assert.ok(ratio(narrow) < ratio(wide) * 0.7, `ρ=0 比值 ${ratio(narrow).toFixed(2)} 應明顯 < ρ=1 ${ratio(wide).toFixed(2)}`);
+});
+
+test('monteCarlo 個股 σ：缺 sigma 欄時回退投組層級 sigma', () => {
+  // INST1 無 sigma 欄，傳入 sigma=18 → 行為等同舊版單一 σ；cagrImplied=μ−σ²/2。
+  const mc = monteCarlo({ instruments: INST1, mode: 'lump', budget: 1000, gross: 8, years: 5, sigma: 18, paths: 100, seed: 1 });
+  assert.ok(Math.abs(mc.cagrImplied - (8 - 0.18 * 0.18 / 2 * 100)) < 1e-6, `cagrImplied=${mc.cagrImplied}`);
+});
+
 /* ---------- Task 2.1：HIST_RETURNS 歷史月報酬資料 ---------- */
 
 import { HIST_RETURNS } from '../engine.mjs';

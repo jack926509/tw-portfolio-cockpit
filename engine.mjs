@@ -111,44 +111,52 @@ export function simulate({ instruments, mode, budget, gross, years, sweepId }) {
   return { series, lookTsmc, buys, finalTotal: total(), invested };
 }
 
-/* ---------- 蒙地卡羅引擎（投組總額層級、GBM 對數常態） ----------
-   月 factor = exp((μ−σ²/2)/12 + σ/√12·z)，z~N(0,1)；
-   - σ=0 時 factor=exp(μ/12)，期末貼齊 simulate 連續複利（核心一致性）。
-   - 對數常態本身 ≥0，故移除舊版 factor>0?factor:0 截斷（該截斷會偏高）。
-   - gross 視為算術平均年報酬，扣配置加權內扣得投組 μ；股利在投組內掃轉不離開，
-     總額層級不另扣 divYield。隱含幾何報酬 cagrImplied ≈ μ − σ²/2。
-   - 接受可注入 seed，未給時以參數雜湊產生穩定種子（仍可重現）。
-   - dist='t' 時月衝擊改用標準化 Student-t（厚尾，自由度 nu），σ 意義不變。  */
-export function monteCarlo({ instruments, mode, budget, gross, years, sigma, paths, seed, dist = "normal", nu = 5 }) {
+/* ---------- 蒙地卡羅引擎（逐標的、單因子等相關、GBM 對數常態） ----------
+   每檔月衝擊 ε_i = σ_i/√12 ·(√ρ·z0 + √(1−ρ)·z_i)，z0 為共同（市場）因子、z_i 為個股獨立因子；
+   任兩檔相關係數恆為 ρ（等相關）。月 factor_i = exp((μ_i−σ_i²/2)/12 + ε_i)。
+   - σ_i 來源：標的有 sigma 欄則用之，否則回退傳入的投組層級 sigma（向後相容）。
+   - μ_i = (gross − fee_i)/100；σ_i=0 時無衝擊，期末貼齊 simulate 連續複利（核心一致性）。
+   - 對數常態本身 ≥0，無需截斷。dist='t' 時 z0/z_i 改用標準化 Student-t（厚尾），σ 意義不變。
+   - 投組幾何報酬 cagrImplied = μ_p − σ_p²/2，σ_p² 由等相關共變異數矩陣求得。
+   - 接受可注入 seed，確保可重現。                                              */
+export function monteCarlo({ instruments, mode, budget, gross, years, sigma, paths, seed, dist = "normal", nu = 5, rho = 0.7 }) {
   const list = instruments;
+  const n = list.length;
   const sumAlloc = list.reduce((s, i) => s + num(i.alloc), 0) || 1;
-  const wFee = list.reduce((s, i) => s + (num(i.alloc) / sumAlloc) * num(i.fee), 0); // 加權平均內扣
-  const muAnnual = (gross - wFee) / 100;          // 投組算術年報酬（小數）
-  const sigAnnual = num(sigma) / 100;
-  const driftM = (muAnnual - sigAnnual * sigAnnual / 2) / 12;  // 月對數漂移
-  const sigM = sigAnnual / Math.sqrt(12);
+  const w = list.map((i) => num(i.alloc) / sumAlloc);                 // 配置權重
+  const muM = list.map((i) => ((gross - num(i.fee)) / 100) / 12);     // 各標的月算術漂移
+  const sigA = list.map((i) => (i.sigma != null ? num(i.sigma) : num(sigma)) / 100); // 各標的年化波動
+  const sigM = sigA.map((s) => s / Math.sqrt(12));
+  const driftM = list.map((_, k) => muM[k] - (sigA[k] * sigA[k]) / 2 / 12);          // (μ_i−σ_i²/2)/12
+  const r = Math.max(0, Math.min(1, num(rho)));
+  const rt = Math.sqrt(r), ri = Math.sqrt(1 - r);                     // 共同 / 獨立因子載荷
   const months = years * 12;
   const N = Math.max(1, Math.round(paths));
 
-  const start = mode === "lump" ? budget : 0;
+  const startW = mode === "lump" ? budget : 0;
   const contrib = mode === "monthly" ? budget : 0;
   const rng = makeRng(seed != null ? seed : 1234567);
   const useT = dist === "t";
+  let g = null;   // 常態 gaussianPair 一次給兩個，交替使用以免浪費
+  const draw = () => {
+    if (useT) return studentT(rng, nu);
+    if (g !== null) { const v = g; g = null; return v; }
+    const pr = gaussianPair(rng); g = pr[1]; return pr[0];
+  };
 
-  // yearVals[y] = 該年底各路徑的資產陣列，用來取分位數
+  // yearVals[y] = 該年底各路徑的投組總資產，用來取分位數
   const yearVals = Array.from({ length: years + 1 }, () => new Float64Array(N));
   for (let p = 0; p < N; p++) {
-    let bal = start;
-    yearVals[0][p] = bal;
-    let cached = null;   // gaussianPair 一次給兩個，交替使用（常態用）
+    const bal = w.map((wi) => startW * wi);
+    yearVals[0][p] = startW;
     for (let m = 1; m <= months; m++) {
-      bal += contrib;
-      let z;
-      if (useT) { z = studentT(rng, nu); }
-      else if (cached === null) { const pair = gaussianPair(rng); z = pair[0]; cached = pair[1]; }
-      else { z = cached; cached = null; }
-      bal *= Math.exp(driftM + sigM * z);   // GBM 對數常態月步進（恆 ≥0，無需截斷）
-      if (m % 12 === 0) yearVals[m / 12][p] = bal;
+      const z0 = draw();                                  // 共同市場因子
+      for (let k = 0; k < n; k++) {
+        bal[k] += contrib * w[k];
+        const eps = sigM[k] * (rt * z0 + ri * draw());    // 個股 = 共同 + 獨立
+        bal[k] *= Math.exp(driftM[k] + eps);
+      }
+      if (m % 12 === 0) { let tot = 0; for (let k = 0; k < n; k++) tot += bal[k]; yearVals[m / 12][p] = tot; }
     }
   }
 
@@ -163,7 +171,12 @@ export function monteCarlo({ instruments, mode, budget, gross, years, sigma, pat
   const medianFinal = quantile(finals, 0.50);
   const aboveInvested = (yearVals[years].reduce((s, v) => s + (v >= invested ? 1 : 0), 0) / N) * 100;
   const aboveDouble = (yearVals[years].reduce((s, v) => s + (v >= invested * 2 ? 1 : 0), 0) / N) * 100;
-  const cagrImplied = (muAnnual - (sigAnnual * sigAnnual) / 2) * 100; // 波動拖累後的幾何年報酬
+  // 投組算術年報酬與等相關變異數：σ_p² = (1−ρ)Σwᵢ²σᵢ² + ρ(Σwᵢσᵢ)²
+  const muP = list.reduce((s, _, k) => s + w[k] * ((gross - num(list[k].fee)) / 100), 0);
+  const sumW2S2 = list.reduce((s, _, k) => s + w[k] * w[k] * sigA[k] * sigA[k], 0);
+  const sumWS = list.reduce((s, _, k) => s + w[k] * sigA[k], 0);
+  const varP = (1 - r) * sumW2S2 + r * sumWS * sumWS;
+  const cagrImplied = (muP - varP / 2) * 100; // 波動拖累後的幾何年報酬
 
   return { series, invested, medianFinal, medianMultiple: invested ? medianFinal / invested : 0, aboveInvested, aboveDouble, cagrImplied, paths: N };
 }
