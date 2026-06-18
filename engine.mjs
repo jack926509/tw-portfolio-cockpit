@@ -36,3 +36,61 @@ export function quantile(sorted, p) {
   if (lo === hi) return sorted[lo];
   return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
 }
+
+/* ---------- 確定性試算引擎（連續複利） ----------
+   月成長率採連續複利 exp(a/12)-1，使「年化報酬 a、t 年」單筆期末
+   恰為 本金·e^(a·t)；σ=0 的蒙地卡羅亦由此貼齊（核心一致性）。     */
+export function simulate({ instruments, mode, budget, gross, years, sweepId }) {
+  const list = instruments;
+  const sumAlloc = list.reduce((s, i) => s + Math.max(0, +i.alloc || 0), 0) || 1;
+  const amt = {};
+  list.forEach((i) => (amt[i.id] = (budget * Math.max(0, +i.alloc || 0)) / sumAlloc));
+  const validSweep = list.some((i) => i.id === sweepId) ? sweepId : null;
+
+  const mrate = (annual) => Math.exp(annual / 100 / 12) - 1;   // 連續複利月率
+  const netRate = (i) => {
+    if (i.id === validSweep) return gross - i.fee;
+    if (i.distributes) return gross - i.divYield - i.fee;
+    return gross - i.fee;
+  };
+
+  // 每檔月成長率只與輸入有關，預先算好，避免每月迴圈內重複呼叫 exp。
+  const monthly = {};
+  list.forEach((i) => (monthly[i.id] = mrate(netRate(i))));
+
+  const bal = {};
+  list.forEach((i) => (bal[i.id] = mode === "lump" ? amt[i.id] : 0));
+  const months = years * 12;
+  const total = () => list.reduce((s, i) => s + bal[i.id], 0);
+  const snap = () => { const o = {}; list.forEach((i) => (o[i.id] = bal[i.id])); return o; };
+
+  let invested = mode === "lump" ? budget : 0;
+  const series = [{ year: 0, total: total(), invested, divSwept: 0, ...snap() }];
+
+  for (let m = 1; m <= months; m++) {
+    list.forEach((i) => {
+      if (mode === "monthly") bal[i.id] += amt[i.id];
+      bal[i.id] *= 1 + monthly[i.id];
+    });
+    if (mode === "monthly") invested += budget;
+    if (m % 12 === 0) {
+      let swept = 0;
+      list.forEach((i) => {
+        if (i.id !== validSweep && i.distributes) {
+          const d = bal[i.id] * (i.divYield / 100);
+          swept += d;
+          if (validSweep) bal[validSweep] += d;
+        }
+      });
+      series.push({ year: m / 12, total: total(), invested, divSwept: swept, ...snap() });
+    }
+  }
+
+  const lookTsmc = list.reduce((s, i) => s + amt[i.id] * (i.tsmcW / 100), 0) / (budget || 1) * 100;
+  const buys = list.map((i) => {
+    const a = amt[i.id];
+    const sh = i.price > 0 ? Math.floor(a / i.price) : 0;
+    return { ...i, amount: a, shares: sh, cost: sh * i.price, leftover: a - sh * i.price };
+  });
+  return { series, lookTsmc, buys, finalTotal: total(), invested };
+}
