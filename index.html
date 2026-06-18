@@ -362,13 +362,13 @@ function App() {
   // 抓最新收盤價：上市走證交所 OpenAPI、上櫃走櫃買中心 TPEx OpenAPI，皆免金鑰、
   // 單次回傳全市場（含 ETF）。兩者都未送 CORS 標頭，純前端直連會被瀏覽器擋下，
   // 故每個來源都依序嘗試「直連 → corsproxy.io → allorigins」，任一成功即止。
+  const PROXIES = (target) => [
+    target,
+    "https://corsproxy.io/?url=" + encodeURIComponent(target),
+    "https://api.allorigins.win/raw?url=" + encodeURIComponent(target),
+  ];
   const fetchJsonWithProxy = async (target) => {
-    const attempts = [
-      target,
-      "https://corsproxy.io/?url=" + encodeURIComponent(target),
-      "https://api.allorigins.win/raw?url=" + encodeURIComponent(target),
-    ];
-    for (const url of attempts) {
+    for (const url of PROXIES(target)) {
       try {
         const res = await fetch(url);
         if (!res.ok) continue;
@@ -378,14 +378,37 @@ function App() {
     }
     return null;
   };
+  // FinMind 逐檔備援（免 token）：抓近 14 日收盤取最後一筆，回傳 {price, divYield}。
+  const fetchFinMind = async (code) => {
+    const d = new Date(); d.setDate(d.getDate() - 14);
+    const start = d.toISOString().slice(0, 10);
+    const get = async (dataset) => {
+      const target = "https://api.finmindtrade.com/api/v4/data?dataset=" + dataset + "&data_id=" + encodeURIComponent(code) + "&start_date=" + start;
+      for (const url of PROXIES(target)) {
+        try {
+          const res = await fetch(url); if (!res.ok) continue;
+          const j = await res.json();
+          if (j && Array.isArray(j.data) && j.data.length) return j.data;
+        } catch (e) { /* 換下一個來源 */ }
+      }
+      return null;
+    };
+    const out = {};
+    const px = await get("TaiwanStockPrice");
+    if (px) { const p = num(px[px.length - 1].close); if (p > 0) out.price = p; }
+    const per = await get("TaiwanStockPER");
+    if (per) { const y = num(per[per.length - 1].dividend_yield); if (y > 0) out.divYield = y; }
+    return out;
+  };
   const fetchPrices = async () => {
     setPriceStatus({ state: "loading" });
     const parsePrice = (v) => num(String(v == null ? "" : v).replace(/,/g, "")); // 去除千分位逗號
-    const map = {};
-    // 上市與上櫃並行抓取，各自處理代理備援
-    const [tw, tp] = await Promise.all([
+    const map = {}, ymap = {};
+    // 上市收盤、上櫃收盤、上市殖利率/PER 三來源並行抓取，各自處理代理備援
+    const [tw, tp, yld] = await Promise.all([
       fetchJsonWithProxy("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL"),
       fetchJsonWithProxy("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"),
+      fetchJsonWithProxy("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL"),
     ]);
     if (tw) tw.forEach((r) => { const c = r.Code; if (c) map[String(c).trim()] = parsePrice(r.ClosingPrice); });
     // TPEx 欄位名以 SecuritiesCompanyCode / Close 為主，保留備援鍵名以防欄位調整
@@ -393,22 +416,43 @@ function App() {
       const c = r.SecuritiesCompanyCode || r.Code || r.CompanyCode;
       if (c) map[String(c).trim()] = parsePrice(r.Close != null ? r.Close : r.ClosingPrice);
     });
+    // BWIBBU_ALL：殖利率欄位以 DividendYield 為主
+    if (yld) yld.forEach((r) => { const c = r.Code; if (c) ymap[String(c).trim()] = num(r.DividendYield); });
+
+    // 大盤來源全失敗：逐檔改走 FinMind 備援（持有檔數通常不多，序列呼叫即可）
+    let usedFinMind = 0;
     if (!tw && !tp) {
-      setPriceStatus({ state: "err", msg: "抓取失敗（上市/上櫃來源與 CORS 代理皆無法連線），可改手動填入。" });
-      return;
+      for (const i of instruments) {
+        const key = String(i.ticker || "").trim();
+        if (!key) continue;
+        const r = await fetchFinMind(key);
+        if (r.price) { map[key] = r.price; usedFinMind++; }
+        if (r.divYield != null) ymap[key] = r.divYield;
+      }
+      if (!usedFinMind) {
+        setPriceStatus({ state: "err", msg: "抓取失敗（上市/上櫃 OpenAPI、CORS 代理與 FinMind 備援皆無法連線），可改手動填入。", date: null });
+        return;
+      }
     }
-    let hit = 0, miss = [];
+
+    let hit = 0, yhit = 0, miss = [];
     setInstruments((arr) => arr.map((i) => {
       const key = String(i.ticker || "").trim();
       const p = map[key];
-      if (key && Number.isFinite(p) && p > 0) { hit++; return { ...i, price: p }; }
-      if (key) miss.push(key);
-      return i;
+      const y = ymap[key];
+      const next = { ...i };
+      if (key && Number.isFinite(p) && p > 0) { hit++; next.price = p; }
+      else if (key) miss.push(key);
+      if (key && Number.isFinite(y) && y >= 0 && Object.prototype.hasOwnProperty.call(ymap, key)) { yhit++; next.divYield = y; }
+      return next;
     }));
-    const srcLabel = tw && tp ? "上市+上櫃" : (tw ? "僅上市（上櫃來源失敗）" : "僅上櫃（上市來源失敗）");
+    const srcParts = [];
+    if (tw) srcParts.push("上市"); if (tp) srcParts.push("上櫃");
+    if (yld) srcParts.push("殖利率"); if (usedFinMind) srcParts.push("FinMind×" + usedFinMind);
     setPriceStatus({
       state: "ok",
-      msg: "已更新 " + hit + " 檔（" + srcLabel + "）" + (miss.length ? "，查無：" + miss.join("、") : ""),
+      msg: "已更新股價 " + hit + " 檔、殖利率 " + yhit + " 檔（來源：" + (srcParts.join("+") || "—") + "）" + (miss.length ? "，查無：" + miss.join("、") : ""),
+      date: new Date().toLocaleDateString("zh-TW"),
     });
   };
 
@@ -833,7 +877,7 @@ function App() {
           </div>
           {priceStatus && priceStatus.state !== "loading" && (
             <div style={{ fontSize: 11, marginBottom: 8, color: priceStatus.state === "err" ? C.red : C.jade }}>
-              {priceStatus.msg} · 最近收盤價、非盤中即時
+              {priceStatus.msg} · 最近收盤價、非盤中即時{priceStatus.date ? " · 擷取日 " + priceStatus.date : ""}
             </div>
           )}
 
@@ -874,7 +918,7 @@ function App() {
             </table>
           </div>
           <div style={{ fontSize: 11, color: C.muted, marginTop: 8, lineHeight: 1.6 }}>
-            「台積權重%」是該標的內部持有多少台積電（2330 填 100、非電子股填 0），用來算最上方的穿透集中度。
+            「台積權重%」是該標的內部持有多少台積電（2330 填 100、非電子股填 0），用來算最上方的穿透集中度；此為手動常數，請依各基金月報自行更新。
             「配息」打勾的標的，其現金股利會在每年底自動掃進你選的複利目標（預設 009816）；目標本身不配息、全部滾入再投資。
             「波動%」是各標的年化波動度，供進階「參數化」模型逐標的模擬用（市值型 ETF 約 18、主動型約 22、個股約 30）；歷史拔靴模型不使用此欄。
           </div>
