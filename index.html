@@ -326,34 +326,44 @@ function App() {
   const allocSum = instruments.reduce((s, i) => s + num(i.alloc), 0);
 
   // 抓最新收盤價：證交所 OpenAPI，免金鑰、單次回傳全市場上市個股（含 ETF）。
+  // 證交所未送 CORS 標頭，純前端直連會被瀏覽器擋下，故失敗時自動改走公用 CORS 代理。
   const fetchPrices = async () => {
     setPriceStatus({ state: "loading" });
-    try {
-      const res = await fetch("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL");
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      const rows = await res.json();
-      const map = {};
-      let dataDate = "";
-      const parsePrice = (v) => num(String(v == null ? "" : v).replace(/,/g, "")); // 去除千分位逗號
-      rows.forEach((r) => {
-        if (r.Code) map[String(r.Code).trim()] = parsePrice(r.ClosingPrice);
-        if (r.Date && !dataDate) dataDate = String(r.Date);
-      });
-      let hit = 0, miss = [];
-      setInstruments((arr) => arr.map((i) => {
-        const key = String(i.ticker || "").trim();
-        const p = map[key];
-        if (key && Number.isFinite(p) && p > 0) { hit++; return { ...i, price: p }; }
-        if (key) miss.push(key);
-        return i;
-      }));
-      setPriceStatus({
-        state: "ok", date: dataDate,
-        msg: "已更新 " + hit + " 檔" + (miss.length ? "，查無：" + miss.join("、") + "（上櫃股或代號不在上市清單）" : ""),
-      });
-    } catch (e) {
-      setPriceStatus({ state: "err", msg: "抓取失敗（可能為跨域 CORS 限制或暫時無法連線），可改手動填入。" });
+    const TARGET = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL";
+    const attempts = [
+      { url: TARGET, via: "" },
+      { url: "https://corsproxy.io/?url=" + encodeURIComponent(TARGET), via: "代理" },
+      { url: "https://api.allorigins.win/raw?url=" + encodeURIComponent(TARGET), via: "代理" },
+    ];
+    let rows = null, usedVia = "";
+    for (const a of attempts) {
+      try {
+        const res = await fetch(a.url);
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        if (Array.isArray(data) && data.length) { rows = data; usedVia = a.via; break; }
+      } catch (e) { /* 換下一個來源 */ }
     }
+    if (!rows) {
+      setPriceStatus({ state: "err", msg: "抓取失敗（來源與 CORS 代理皆無法連線），可改手動填入。" });
+      return;
+    }
+    const map = {};
+    const parsePrice = (v) => num(String(v == null ? "" : v).replace(/,/g, "")); // 去除千分位逗號
+    rows.forEach((r) => { if (r.Code) map[String(r.Code).trim()] = parsePrice(r.ClosingPrice); });
+    let hit = 0, miss = [];
+    setInstruments((arr) => arr.map((i) => {
+      const key = String(i.ticker || "").trim();
+      const p = map[key];
+      if (key && Number.isFinite(p) && p > 0) { hit++; return { ...i, price: p }; }
+      if (key) miss.push(key);
+      return i;
+    }));
+    setPriceStatus({
+      state: "ok",
+      msg: "已更新 " + hit + " 檔" + (usedVia ? "（經 CORS 代理）" : "")
+        + (miss.length ? "，查無：" + miss.join("、") + "（上櫃股或代號不在上市清單）" : ""),
+    });
   };
 
   // 設定匯出/匯入（JSON），方便備份與分享；匯入一律經 sanitizeState 清理。
@@ -559,7 +569,7 @@ function App() {
           </div>
           {priceStatus && priceStatus.state !== "loading" && (
             <div style={{ fontSize: 11, marginBottom: 8, color: priceStatus.state === "err" ? C.red : C.jade }}>
-              {priceStatus.msg}{priceStatus.date ? "（資料日期 " + priceStatus.date + "）" : ""} · 僅上市最近收盤價、非盤中即時
+              {priceStatus.msg} · 僅上市最近收盤價、非盤中即時
             </div>
           )}
 
