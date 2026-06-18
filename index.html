@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>台股配置控制台 · 定期定額與穿透集中度試算</title>
+<meta name="description" content="台股 ETF 與個股的定期定額累積試算、股利掃入複利目標、穿透台積電集中度分析。可自行增刪標的。" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Noto+Sans+TC:wght@400;500;700&display=swap');
+  :root{ --mono:'JetBrains Mono',ui-monospace,monospace; --sans:'Noto Sans TC',system-ui,sans-serif; }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:#E8EBF0}
+  #root{min-height:100%}
+  input,select,button{font-family:inherit}
+  input:focus,select:focus{border-color:#1FA088 !important}
+  .num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .card{background:#FFFFFF;border:1px solid #D6DBE4;border-radius:14px}
+  .btn{cursor:pointer;border:1px solid #D6DBE4;background:#fff;border-radius:8px;padding:7px 12px;font-size:12.5px;color:#11151C;display:inline-flex;align-items:center;gap:6px}
+  .btn:hover{background:#F2F4F8}
+  @media (max-width:560px){ .grid2{grid-template-columns:1fr !important} .hidemob{display:none} }
+  /* 載入中提示 */
+  .boot{font-family:var(--sans);color:#6B7480;font-size:14px;display:flex;height:60vh;align-items:center;justify-content:center}
+</style>
+</head>
+<body>
+<div id="root"><div class="boot">載入中…（第一次會抓取 React 與圖表元件）</div></div>
+
+<!-- 相依套件：順序很重要，React 要先於 Recharts -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/prop-types@15/prop-types.min.js"></script>
+<script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo } = React;
+const { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Line, ComposedChart } = Recharts;
+
+/* ---------- 圖示（inline SVG，免外部圖示套件） ---------- */
+const Svg = ({ size = 14, children }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+    strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">{children}</svg>
+);
+const Plus = (p) => <Svg {...p}><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></Svg>;
+const Trash2 = (p) => <Svg {...p}><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></Svg>;
+const RotateCcw = (p) => <Svg {...p}><polyline points="1 4 1 10 7 10" /><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" /></Svg>;
+const Coins = (p) => <Svg {...p}><circle cx="8" cy="8" r="6" /><path d="M18.09 10.37A6 6 0 1 1 10.34 18" /><path d="M7 6h1v4" /><path d="m16.71 13.88.7.71-2.82 2.82" /></Svg>;
+
+/* ---------- 主題 ---------- */
+const C = {
+  canvas: "#E8EBF0", panel: "#FFFFFF", ink: "#11151C", inkPanel: "#12161E",
+  border: "#D6DBE4", muted: "#6B7480", red: "#E23B4E", jade: "#1FA088",
+  blue: "#3B6FE2", amber: "#E39A2B", warn: "#E0732B",
+};
+const PALETTE = ["#1FA088", "#3B6FE2", "#E39A2B", "#E23B4E", "#8A4FE2", "#2BB0E3", "#E2693B", "#5A9E2B"];
+
+const DEFAULTS = [
+  { id: "009816", name: "凱基台灣TOP50", ticker: "009816", price: 15.3, alloc: 50, fee: 0.10, divYield: 0, tsmcW: 43.5, distributes: false, color: "#1FA088" },
+  { id: "0050",   name: "元大台灣50",     ticker: "0050",   price: 105,  alloc: 0,  fee: 0.15, divYield: 2.0, tsmcW: 64.5, distributes: true,  color: "#3B6FE2" },
+  { id: "00981A", name: "主動統一台股增長", ticker: "00981A", price: 30.8, alloc: 30, fee: 1.0,  divYield: 3.0, tsmcW: 28,   distributes: true,  color: "#E39A2B" },
+  { id: "2330",   name: "台積電",          ticker: "2330",   price: 2385, alloc: 20, fee: 0,    divYield: 0.9, tsmcW: 100,  distributes: true,  color: "#E23B4E" },
+];
+
+const fmtWan = (v) => (v / 10000).toFixed(v >= 1e6 ? 0 : 1) + "萬";
+const fmtNT = (v) => "NT$" + Math.round(v).toLocaleString();
+
+/* ---------- 試算引擎 ---------- */
+function simulate({ instruments, mode, budget, gross, years, sweepId }) {
+  const list = instruments;
+  const sumAlloc = list.reduce((s, i) => s + Math.max(0, +i.alloc || 0), 0) || 1;
+  const amt = {};
+  list.forEach((i) => (amt[i.id] = (budget * Math.max(0, +i.alloc || 0)) / sumAlloc));
+  const validSweep = list.some((i) => i.id === sweepId) ? sweepId : null;
+
+  const mrate = (annual) => Math.pow(1 + annual / 100, 1 / 12) - 1;
+  const netRate = (i) => {
+    if (i.id === validSweep) return gross - i.fee;
+    if (i.distributes) return gross - i.divYield - i.fee;
+    return gross - i.fee;
+  };
+
+  const bal = {};
+  list.forEach((i) => (bal[i.id] = mode === "lump" ? amt[i.id] : 0));
+  const months = years * 12;
+  const total = () => list.reduce((s, i) => s + bal[i.id], 0);
+  const snap = () => { const o = {}; list.forEach((i) => (o[i.id] = bal[i.id])); return o; };
+
+  let invested = mode === "lump" ? budget : 0;
+  const series = [{ year: 0, total: total(), invested, divSwept: 0, ...snap() }];
+
+  for (let m = 1; m <= months; m++) {
+    list.forEach((i) => {
+      if (mode === "monthly") bal[i.id] += amt[i.id];
+      bal[i.id] *= 1 + mrate(netRate(i));
+    });
+    if (mode === "monthly") invested += budget;
+    if (m % 12 === 0) {
+      let swept = 0;
+      list.forEach((i) => {
+        if (i.id !== validSweep && i.distributes) {
+          const d = bal[i.id] * (i.divYield / 100);
+          swept += d;
+          if (validSweep) bal[validSweep] += d;
+        }
+      });
+      series.push({ year: m / 12, total: total(), invested, divSwept: swept, ...snap() });
+    }
+  }
+
+  const lookTsmc = list.reduce((s, i) => s + amt[i.id] * (i.tsmcW / 100), 0) / (budget || 1) * 100;
+  const buys = list.map((i) => {
+    const a = amt[i.id];
+    const sh = i.price > 0 ? Math.floor(a / i.price) : 0;
+    return { ...i, amount: a, shares: sh, cost: sh * i.price, leftover: a - sh * i.price };
+  });
+  return { series, lookTsmc, buys, finalTotal: total(), invested };
+}
+
+/* ---------- UI 小元件 ---------- */
+const Field = ({ label, children }) => (
+  <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+    <span style={{ fontSize: 11, color: C.muted, letterSpacing: ".02em" }}>{label}</span>
+    {children}
+  </label>
+);
+const numInput = {
+  width: "100%", padding: "7px 8px", border: "1px solid " + C.border, borderRadius: 7,
+  fontFamily: "var(--mono)", fontSize: 13, color: C.ink, background: "#FBFCFD", outline: "none",
+};
+function Stat({ label, val, sub, color }) {
+  return (
+    <div>
+      <div style={{ fontSize: 11, color: C.muted }}>{label}</div>
+      <div className="num" style={{ fontSize: 24, fontWeight: 700, color: color || C.ink, lineHeight: 1.2 }}>{val}</div>
+      <div className="num" style={{ fontSize: 11, color: C.muted }}>{sub}</div>
+    </div>
+  );
+}
+
+const STORE_KEY = "tw_cockpit_v1";
+
+function App() {
+  const [instruments, setInstruments] = useState(DEFAULTS);
+  const [mode, setMode] = useState("monthly");
+  const [budget, setBudget] = useState(15000);
+  const [gross, setGross] = useState(7);
+  const [years, setYears] = useState(20);
+  const [sweepId, setSweepId] = useState("009816");
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORE_KEY);
+      if (raw) {
+        const d = JSON.parse(raw);
+        if (d.instruments && d.instruments.length) {
+          setInstruments(d.instruments); setMode(d.mode); setBudget(d.budget);
+          setGross(d.gross); setYears(d.years); setSweepId(d.sweepId);
+        }
+      }
+    } catch (e) { /* 用預設 */ }
+    setLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    try { localStorage.setItem(STORE_KEY, JSON.stringify({ instruments, mode, budget, gross, years, sweepId })); }
+    catch (e) { /* 忽略 */ }
+  }, [instruments, mode, budget, gross, years, sweepId, loaded]);
+
+  const R = useMemo(() => simulate({ instruments, mode, budget, gross, years, sweepId }),
+    [instruments, mode, budget, gross, years, sweepId]);
+
+  const allocSum = instruments.reduce((s, i) => s + (+i.alloc || 0), 0);
+
+  const update = (id, k, v) => setInstruments((arr) => arr.map((i) => (i.id === id ? { ...i, [k]: v } : i)));
+  const addRow = () => {
+    const id = "X" + Math.random().toString(36).slice(2, 6);
+    setInstruments((arr) => [...arr, {
+      id, name: "新標的", ticker: "", price: 100, alloc: 0, fee: 0.3,
+      divYield: 2, tsmcW: 0, distributes: true, color: PALETTE[arr.length % PALETTE.length],
+    }]);
+  };
+  const removeRow = (id) => setInstruments((arr) => {
+    const next = arr.filter((i) => i.id !== id);
+    if (id === sweepId && next.length) setSweepId(next[0].id);
+    return next;
+  });
+  const reset = () => {
+    setInstruments(DEFAULTS); setMode("monthly"); setBudget(15000);
+    setGross(7); setYears(20); setSweepId("009816");
+  };
+
+  const zone = R.lookTsmc >= 55 ? { label: "過度集中", color: C.red }
+    : R.lookTsmc >= 45 ? { label: "偏高", color: C.warn }
+      : { label: "尚可", color: C.jade };
+  const needle = Math.min(100, Math.max(0, R.lookTsmc));
+  const finalDiv = R.series.length ? R.series[R.series.length - 1].divSwept : 0;
+  const multiple = R.invested ? R.finalTotal / R.invested : 0;
+
+  return (
+    <div style={{ background: C.canvas, minHeight: "100%", fontFamily: "var(--sans)", color: C.ink, padding: "20px 16px" }}>
+      <div style={{ maxWidth: 940, margin: "0 auto" }}>
+        <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
+          <div>
+            <div style={{ fontSize: 22, fontWeight: 700, letterSpacing: "-.01em" }}>台股配置控制台</div>
+            <div style={{ fontSize: 12.5, color: C.muted, marginTop: 2 }}>定期定額試算 · 穿透集中度 · 股利全掃複利目標</div>
+          </div>
+          <button className="btn" onClick={reset}><RotateCcw size={14} /> 重設預設</button>
+        </div>
+
+        <div className="grid2" style={{ display: "grid", gridTemplateColumns: "1.1fr 1fr", gap: 12, marginBottom: 12 }}>
+          <div className="card" style={{ background: C.inkPanel, padding: 18, color: "#fff" }}>
+            <div style={{ fontSize: 11.5, color: "#9aa3b2", letterSpacing: ".06em", textTransform: "uppercase" }}>穿透台積電集中度</div>
+            <div style={{ display: "flex", alignItems: "flex-end", gap: 10, margin: "6px 0 12px" }}>
+              <div className="num" style={{ fontSize: 46, fontWeight: 700, lineHeight: 1, color: zone.color }}>{R.lookTsmc.toFixed(0)}%</div>
+              <div style={{ paddingBottom: 6, fontSize: 13, color: zone.color, fontWeight: 600 }}>{zone.label}</div>
+            </div>
+            <div style={{ position: "relative", height: 12, borderRadius: 6, overflow: "hidden", display: "flex" }}>
+              <div style={{ width: "45%", background: "rgba(31,160,136,.55)" }} />
+              <div style={{ width: "10%", background: "rgba(224,115,43,.6)" }} />
+              <div style={{ width: "45%", background: "rgba(226,59,78,.6)" }} />
+              <div style={{ position: "absolute", top: -3, left: "calc(" + needle + "% - 1px)", width: 2, height: 18, background: "#fff", boxShadow: "0 0 6px rgba(0,0,0,.6)" }} />
+            </div>
+            <div className="num" style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#7c8597", marginTop: 5 }}>
+              <span>0</span><span>45 尚可</span><span>55</span><span>100%</span>
+            </div>
+            <div style={{ fontSize: 11.5, color: "#9aa3b2", marginTop: 10, lineHeight: 1.5 }}>
+              台積電是多數市值型 ETF 的最大持股，單獨加買 2330 會讓你的錢更集中在一家公司。
+            </div>
+          </div>
+
+          <div className="card" style={{ padding: 18 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+              <Stat label={mode === "monthly" ? years + "年累計投入" : "投入本金"} val={fmtWan(R.invested)} sub={fmtNT(R.invested)} />
+              <Stat label={years + "年累積資產"} val={fmtWan(R.finalTotal)} sub={"成長 " + multiple.toFixed(2) + "×"} color={C.red} />
+              <Stat label="複利增額" val={fmtWan(R.finalTotal - R.invested)} sub={"年化 " + gross + "% 假設"} />
+              <Stat label="末年掃入股利" val={fmtNT(finalDiv)} sub="進口袋現金＝0" color={C.jade} />
+            </div>
+          </div>
+        </div>
+
+        <div className="card" style={{ padding: 16, marginBottom: 12 }}>
+          <div className="grid2" style={{ display: "grid", gridTemplateColumns: "auto auto 1fr 1fr auto", gap: 16, alignItems: "center" }}>
+            <Field label="投入方式">
+              <div style={{ display: "flex", border: "1px solid " + C.border, borderRadius: 8, overflow: "hidden" }}>
+                {[["monthly", "每月"], ["lump", "單筆"]].map(([k, l]) => (
+                  <button key={k} onClick={() => setMode(k)}
+                    style={{ padding: "7px 14px", fontSize: 13, border: "none", cursor: "pointer", background: mode === k ? C.ink : "#fff", color: mode === k ? "#fff" : C.muted }}>{l}</button>
+                ))}
+              </div>
+            </Field>
+            <Field label={mode === "monthly" ? "每月金額" : "單筆金額"}>
+              <input className="num" style={{ ...numInput, width: 120 }} type="number" value={budget}
+                onChange={(e) => setBudget(Math.max(0, +e.target.value))} />
+            </Field>
+            <Field label={"年化報酬假設 — " + gross + "%"}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <input type="range" min="0" max="15" step="0.5" value={gross} onChange={(e) => setGross(+e.target.value)} style={{ flex: 1, accentColor: C.red }} />
+                <span className="hidemob" style={{ display: "flex", gap: 4 }}>
+                  {[["保守", 5], ["基準", 7], ["樂觀", 9]].map(([l, v]) => (
+                    <button key={v} onClick={() => setGross(v)} className="btn" style={{ padding: "3px 8px", fontSize: 11 }}>{l}</button>
+                  ))}
+                </span>
+              </div>
+            </Field>
+            <Field label={"投資年期 — " + years + " 年"}>
+              <input type="range" min="1" max="40" value={years} onChange={(e) => setYears(+e.target.value)} style={{ accentColor: C.red }} />
+            </Field>
+            <Field label="股利掃入目標">
+              <select style={{ ...numInput, fontFamily: "var(--sans)" }} value={sweepId} onChange={(e) => setSweepId(e.target.value)}>
+                {instruments.map((i) => <option key={i.id} value={i.id}>{i.name}</option>)}
+              </select>
+            </Field>
+          </div>
+        </div>
+
+        <div className="card" style={{ padding: 16, marginBottom: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <div style={{ fontSize: 14, fontWeight: 700 }}>標的與配置</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span className="num" style={{ fontSize: 12, color: Math.round(allocSum) === 100 ? C.jade : C.warn }}>
+                配置合計 {allocSum.toFixed(0)}%{Math.round(allocSum) !== 100 ? "（將自動正規化）" : ""}
+              </span>
+              <button className="btn" onClick={addRow}><Plus size={14} /> 新增標的</button>
+            </div>
+          </div>
+
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 720 }}>
+              <thead>
+                <tr style={{ fontSize: 10.5, color: C.muted, textAlign: "left" }}>
+                  {["", "名稱", "代號", "股價", "配置%", "內扣%", "現金殖利%", "台積權重%", "配息", "股數", ""].map((h, j) => (
+                    <th key={j} style={{ padding: "4px 6px", fontWeight: 500, letterSpacing: ".02em" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {R.buys.map((b) => (
+                  <tr key={b.id} style={{ borderTop: "1px solid " + C.border }}>
+                    <td style={{ padding: "6px" }}><span style={{ display: "inline-block", width: 10, height: 10, borderRadius: 3, background: b.color }} /></td>
+                    <td style={{ padding: "6px" }}><input style={{ ...numInput, fontFamily: "var(--sans)", width: 120 }} value={b.name} onChange={(e) => update(b.id, "name", e.target.value)} /></td>
+                    <td style={{ padding: "6px" }}><input style={{ ...numInput, width: 72 }} value={b.ticker} onChange={(e) => update(b.id, "ticker", e.target.value)} /></td>
+                    <td style={{ padding: "6px" }}><input className="num" style={{ ...numInput, width: 72 }} type="number" value={b.price} onChange={(e) => update(b.id, "price", +e.target.value)} /></td>
+                    <td style={{ padding: "6px" }}><input className="num" style={{ ...numInput, width: 58 }} type="number" value={b.alloc} onChange={(e) => update(b.id, "alloc", +e.target.value)} /></td>
+                    <td style={{ padding: "6px" }}><input className="num" style={{ ...numInput, width: 56 }} type="number" step="0.01" value={b.fee} onChange={(e) => update(b.id, "fee", +e.target.value)} /></td>
+                    <td style={{ padding: "6px" }}><input className="num" style={{ ...numInput, width: 56 }} type="number" step="0.1" value={b.divYield} onChange={(e) => update(b.id, "divYield", +e.target.value)} /></td>
+                    <td style={{ padding: "6px" }}><input className="num" style={{ ...numInput, width: 58 }} type="number" step="0.5" value={b.tsmcW} onChange={(e) => update(b.id, "tsmcW", +e.target.value)} /></td>
+                    <td style={{ padding: "6px", textAlign: "center" }}>
+                      <input type="checkbox" checked={b.distributes} onChange={(e) => update(b.id, "distributes", e.target.checked)} style={{ accentColor: C.jade, width: 16, height: 16 }} />
+                    </td>
+                    <td className="num" style={{ padding: "6px", fontSize: 12.5 }}>
+                      <div style={{ fontWeight: 600 }}>{b.shares.toLocaleString()} 股</div>
+                      <div style={{ fontSize: 10.5, color: C.muted }}>{fmtNT(b.cost)}</div>
+                    </td>
+                    <td style={{ padding: "6px" }}>
+                      <button onClick={() => removeRow(b.id)} title="刪除" style={{ border: "none", background: "none", cursor: "pointer", color: C.muted, padding: 4 }}><Trash2 size={15} /></button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 8, lineHeight: 1.6 }}>
+            「台積權重%」是該標的內部持有多少台積電（2330 填 100、非電子股填 0），用來算最上方的穿透集中度。
+            「配息」打勾的標的，其現金股利會在每年底自動掃進你選的複利目標（預設 009816）；目標本身不配息、全部滾入再投資。
+          </div>
+        </div>
+
+        <div className="grid2" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+          <div className="card" style={{ padding: 16 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 4 }}>累積資產 vs 投入本金</div>
+            <div style={{ fontSize: 11, color: C.muted, marginBottom: 8 }}>缺口＝複利貢獻，後段才明顯拉開</div>
+            <ResponsiveContainer width="100%" height={230}>
+              <ComposedChart data={R.series} margin={{ left: -8, right: 6, top: 4 }}>
+                <defs>
+                  <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={C.red} stopOpacity={0.25} />
+                    <stop offset="100%" stopColor={C.red} stopOpacity={0.02} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke="#EEF1F5" vertical={false} />
+                <XAxis dataKey="year" tick={{ fontSize: 11, fill: C.muted }} tickLine={false} axisLine={{ stroke: C.border }} />
+                <YAxis tickFormatter={fmtWan} tick={{ fontSize: 10, fill: C.muted }} tickLine={false} axisLine={false} width={48} />
+                <Tooltip formatter={(v, n) => [fmtWan(v), n === "total" ? "累積資產" : "投入本金"]} labelFormatter={(y) => "第 " + y + " 年"}
+                  contentStyle={{ fontSize: 12, borderRadius: 8, border: "1px solid " + C.border }} />
+                <Area type="monotone" dataKey="total" stroke={C.red} strokeWidth={2.4} fill="url(#g)" />
+                <Line type="monotone" dataKey="invested" stroke={C.muted} strokeWidth={1.4} strokeDasharray="4 4" dot={false} />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div className="card" style={{ padding: 16 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 4 }}>投組組成漂移</div>
+            <div style={{ fontSize: 11, color: C.muted, marginBottom: 8 }}>股利掃入後，複利目標會越長越大</div>
+            <ResponsiveContainer width="100%" height={230}>
+              <AreaChart data={R.series} margin={{ left: -8, right: 6, top: 4 }}>
+                <CartesianGrid stroke="#EEF1F5" vertical={false} />
+                <XAxis dataKey="year" tick={{ fontSize: 11, fill: C.muted }} tickLine={false} axisLine={{ stroke: C.border }} />
+                <YAxis tickFormatter={fmtWan} tick={{ fontSize: 10, fill: C.muted }} tickLine={false} axisLine={false} width={48} />
+                <Tooltip formatter={(v, n) => [fmtWan(v), (instruments.find((i) => i.id === n) || {}).name || n]} labelFormatter={(y) => "第 " + y + " 年"}
+                  contentStyle={{ fontSize: 12, borderRadius: 8, border: "1px solid " + C.border }} />
+                {instruments.map((i) => (
+                  <Area key={i.id} type="monotone" dataKey={i.id} stackId="1" stroke={i.color} fill={i.color} fillOpacity={0.85} strokeWidth={0} />
+                ))}
+              </AreaChart>
+            </ResponsiveContainer>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 8 }}>
+              {instruments.map((i) => (
+                <span key={i.id} style={{ fontSize: 11, color: C.muted, display: "flex", alignItems: "center", gap: 5 }}>
+                  <span style={{ width: 9, height: 9, borderRadius: 2, background: i.color }} />{i.name}
+                </span>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ fontSize: 11, color: C.muted, marginTop: 14, lineHeight: 1.6, display: "flex", gap: 6 }}>
+          <span style={{ flexShrink: 0, marginTop: 1 }}><Coins size={14} /></span>
+          <span>純試算工具，非投資建議。模型假設各標的同一毛報酬、直線複利；真實世界報酬不一、會有大幅波動。股價、費用、台積權重請依當天官方資料更新。你的設定會存在這台瀏覽器（localStorage），下次打開還在。</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
