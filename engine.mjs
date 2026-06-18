@@ -181,6 +181,14 @@ export function monteCarlo({ instruments, mode, budget, gross, years, sigma, pat
   return { series, invested, medianFinal, medianMultiple: invested ? medianFinal / invested : 0, aboveInvested, aboveDouble, cagrImplied, paths: N };
 }
 
+/* ---------- CAPE 估值調整：盈餘殖利率 ≈ 長期報酬粗估 ----------
+   CAPE（席勒本益比）的倒數 1/CAPE 為盈餘殖利率，學理上是長期實質報酬的合理錨點。
+   回傳 100/cape（百分比）；cape 無效（≤0 或非數）回傳 0，由 UI 自行決定是否顯示。 */
+export function valuationAdjustedReturn({ cape }) {
+  const c = +cape;
+  return Number.isFinite(c) && c > 0 ? 100 / c : 0;
+}
+
 /* ---------- 平穩拔靴（Politis–Romano 1994） ----------
    從歷史月報酬 pool 以「幾何分布區塊長度」重抽，保留波動叢聚與序列相依（厚尾、序列報酬風險）。
    每步以機率 p=1/avgBlock 重新隨機選起點，否則沿用前一索引 +1（環狀繞回）。

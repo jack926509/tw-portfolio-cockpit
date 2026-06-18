@@ -152,6 +152,21 @@ test('monteCarlo 個股 σ：缺 sigma 欄時回退投組層級 sigma', () => {
   assert.ok(Math.abs(mc.cagrImplied - (8 - 0.18 * 0.18 / 2 * 100)) < 1e-6, `cagrImplied=${mc.cagrImplied}`);
 });
 
+/* ---------- Task 3.3：CAPE 估值調整 ---------- */
+
+import { valuationAdjustedReturn } from '../engine.mjs';
+
+test('valuationAdjustedReturn: ≈100/CAPE（盈餘殖利率，長期報酬粗估）', () => {
+  assert.ok(Math.abs(valuationAdjustedReturn({ cape: 25 }) - 4) < 1e-9);
+  assert.ok(Math.abs(valuationAdjustedReturn({ cape: 20 }) - 5) < 1e-9);
+});
+
+test('valuationAdjustedReturn: 無效 CAPE 回退 0', () => {
+  assert.equal(valuationAdjustedReturn({ cape: 0 }), 0);
+  assert.equal(valuationAdjustedReturn({ cape: -3 }), 0);
+  assert.equal(valuationAdjustedReturn({ cape: 'x' }), 0);
+});
+
 /* ---------- Task 2.1：HIST_RETURNS 歷史月報酬資料 ---------- */
 
 import { HIST_RETURNS } from '../engine.mjs';
