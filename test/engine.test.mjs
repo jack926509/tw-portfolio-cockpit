@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { num, quantile, makeRng, gaussianPair, simulate } from '../engine.mjs';
+import { num, quantile, makeRng, gaussianPair, simulate, monteCarlo } from '../engine.mjs';
 
 const INST1 = [{ id: 'a', ticker: 'a', price: 10, alloc: 100, fee: 0, divYield: 0, tsmcW: 0, distributes: false }];
 
@@ -64,4 +64,25 @@ test('simulate 配置正規化：合計≠100 仍按比例', () => {
   ];
   const r = simulate({ instruments: two, sweepId: 'a', mode: 'lump', budget: 1000, gross: 0, years: 1 });
   assert.ok(Math.abs(r.lookTsmc - 50) < 1e-6, `lookTsmc=${r.lookTsmc}`);
+});
+
+/* ---------- Task 1.4：monteCarlo GBM 對數常態 ---------- */
+
+test('monteCarlo σ=0：三分位重合且=simulate 期末（核心一致性）', () => {
+  const args = { instruments: INST1, mode: 'lump', budget: 1000, gross: 6, years: 20 };
+  const mc = monteCarlo({ ...args, sigma: 0, paths: 200, seed: 7 });
+  const last = mc.series[20];
+  assert.ok(Math.abs(last.p10 - last.p90) < 1e-6, `p10=${last.p10} p90=${last.p90}`);
+  const det = simulate({ ...args, sweepId: 'a' });
+  assert.ok(Math.abs(last.p50 - det.finalTotal) / det.finalTotal < 1e-9, `mc=${last.p50} det=${det.finalTotal}`);
+});
+
+test('monteCarlo cagrImplied = μ − σ²/2', () => {
+  const mc = monteCarlo({ instruments: INST1, mode: 'lump', budget: 1000, gross: 8, years: 5, sigma: 20, paths: 100, seed: 1 });
+  assert.ok(Math.abs(mc.cagrImplied - (8 - 0.2 * 0.2 / 2 * 100)) < 1e-6, `cagrImplied=${mc.cagrImplied}`);
+});
+
+test('monteCarlo 同種子可重現', () => {
+  const mk = () => monteCarlo({ instruments: INST1, mode: 'lump', budget: 1000, gross: 7, years: 10, sigma: 18, paths: 300, seed: 99 });
+  assert.equal(mk().medianFinal, mk().medianFinal);
 });
