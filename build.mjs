@@ -38,9 +38,22 @@ const { code } = await build({
   target: ["es2018"],
 }).then((r) => ({ code: r.outputFiles[0].text }));
 
-// 3) 移除 @babel/standalone（任何 CDN 主機皆可），並用編譯後的純 JS <script> 取代 babel 區塊
+// 2b) 把 engine.mjs 打包成 IIFE 全域 Engine 並內聯（維持單一檔零安裝，正式版不需 module 請求）
+const { code: engineCode } = await build({
+  entryPoints: [resolve(__dirname, "engine.mjs")],
+  bundle: true,
+  minify: true,
+  write: false,
+  format: "iife",
+  globalName: "Engine",
+  target: ["es2018"],
+  footer: { js: "window.Engine=Engine;" },
+}).then((r) => ({ code: r.outputFiles[0].text }));
+
+// 3) 移除 @babel/standalone 與 dev 用的 engine module，內聯引擎，再用編譯後純 JS 取代 babel 區塊
 let out = html.replace(/\s*<script src="https?:\/\/[^"]*@babel\/standalone[^"]*"><\/script>/, "");
-out = out.replace(babelRe, `<script>\n${code}</script>`);
+out = out.replace(/\s*<script type="module">import \* as E from "\.\/engine\.mjs";[^<]*<\/script>/, "");
+out = out.replace(babelRe, `<script>\n${engineCode}\n</script>\n<script>\n${code}</script>`);
 
 await mkdir(OUT_DIR, { recursive: true });
 await writeFile(OUT, out, "utf8");
