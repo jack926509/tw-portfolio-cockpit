@@ -68,10 +68,28 @@ https://<你的帳號>.github.io/<repo 名稱>/
 
 ## 部署到 GitHub Pages
 
+有兩種方式，擇一即可：
+
+### 方式一：直接從分支部署（最簡單，零建置）
+
 1. 將 `index.html` 放進 repo 根目錄（或 `/docs`）。
 2. 進入 repo → **Settings → Pages**。
 3. Source 選 `Deploy from a branch`，branch 選 `main`，資料夾選 `/ (root)`（若放在 docs 則選 `/docs`）。
-4. 儲存後等待一兩分鐘，即可透過上方網址開啟。
+4. 儲存後等待一兩分鐘，即可透過上方網址開啟。此方式直接服務原始 `index.html`（瀏覽器端 Babel）。
+
+### 方式二：GitHub Actions 自動建置部署（載入更快，無 Babel）
+
+repo 已內建 `.github/workflows/deploy.yml`：推送到 `main` 時會自動 `npm run build` 並把預編譯後的 `dist/`（已移除瀏覽器端 Babel）部署到 Pages。
+
+1. 進入 repo → **Settings → Pages**。
+2. Source 改選 **`GitHub Actions`**。
+3. 之後每次推到 `main`，Actions 會自動建置並上線；也可在 Actions 頁面手動執行（workflow_dispatch）。
+
+> 兩種方式只能擇一（Pages 的 Source 是單選）。想要最快首屏就用方式二，想要零設定就用方式一。
+
+## 其他部署平台（Zeabur／Cloudflare Pages／Netlify／Vercel 等）
+
+本工具為純靜態頁面，上述平台皆可部署，但對單檔 HTML 而言**並非必要**——GitHub Pages 已足夠。只有在你之後需要**後端／serverless**（例如為盤中即時報價架設繞過 CORS 的 proxy）或想要亞洲機房低延遲時，才值得考慮 Zeabur 這類 PaaS。靜態檔案的部署設定（建置指令 `npm run build`、輸出目錄 `dist`）與方式二相同。
 
 ## 技術說明
 

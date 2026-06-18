@@ -1,0 +1,48 @@
+# 推送到 main 時，自動把 JSX 預編譯（移除瀏覽器端 Babel）並部署 dist/ 到 GitHub Pages。
+# 注意：需先到 repo Settings → Pages → Source 選「GitHub Actions」，此工作流程才會生效。
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# 讓 GITHUB_TOKEN 有部署 Pages 的權限
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同時間只跑一個部署，新的會取代排隊中的（但不中斷進行中的）
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install deps
+        run: npm install
+      - name: Build (預編譯，移除 Babel)
+        run: npm run build
+      - uses: actions/configure-pages@v5
+      - name: Upload dist artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
