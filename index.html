@@ -325,32 +325,44 @@ function App() {
 
   const allocSum = instruments.reduce((s, i) => s + num(i.alloc), 0);
 
-  // 抓最新收盤價：證交所 OpenAPI，免金鑰、單次回傳全市場上市個股（含 ETF）。
-  // 證交所未送 CORS 標頭，純前端直連會被瀏覽器擋下，故失敗時自動改走公用 CORS 代理。
-  const fetchPrices = async () => {
-    setPriceStatus({ state: "loading" });
-    const TARGET = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL";
+  // 抓最新收盤價：上市走證交所 OpenAPI、上櫃走櫃買中心 TPEx OpenAPI，皆免金鑰、
+  // 單次回傳全市場（含 ETF）。兩者都未送 CORS 標頭，純前端直連會被瀏覽器擋下，
+  // 故每個來源都依序嘗試「直連 → corsproxy.io → allorigins」，任一成功即止。
+  const fetchJsonWithProxy = async (target) => {
     const attempts = [
-      { url: TARGET, via: "" },
-      { url: "https://corsproxy.io/?url=" + encodeURIComponent(TARGET), via: "代理" },
-      { url: "https://api.allorigins.win/raw?url=" + encodeURIComponent(TARGET), via: "代理" },
+      target,
+      "https://corsproxy.io/?url=" + encodeURIComponent(target),
+      "https://api.allorigins.win/raw?url=" + encodeURIComponent(target),
     ];
-    let rows = null, usedVia = "";
-    for (const a of attempts) {
+    for (const url of attempts) {
       try {
-        const res = await fetch(a.url);
-        if (!res.ok) throw new Error("HTTP " + res.status);
+        const res = await fetch(url);
+        if (!res.ok) continue;
         const data = await res.json();
-        if (Array.isArray(data) && data.length) { rows = data; usedVia = a.via; break; }
+        if (Array.isArray(data) && data.length) return data;
       } catch (e) { /* 換下一個來源 */ }
     }
-    if (!rows) {
-      setPriceStatus({ state: "err", msg: "抓取失敗（來源與 CORS 代理皆無法連線），可改手動填入。" });
+    return null;
+  };
+  const fetchPrices = async () => {
+    setPriceStatus({ state: "loading" });
+    const parsePrice = (v) => num(String(v == null ? "" : v).replace(/,/g, "")); // 去除千分位逗號
+    const map = {};
+    // 上市與上櫃並行抓取，各自處理代理備援
+    const [tw, tp] = await Promise.all([
+      fetchJsonWithProxy("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL"),
+      fetchJsonWithProxy("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"),
+    ]);
+    if (tw) tw.forEach((r) => { const c = r.Code; if (c) map[String(c).trim()] = parsePrice(r.ClosingPrice); });
+    // TPEx 欄位名以 SecuritiesCompanyCode / Close 為主，保留備援鍵名以防欄位調整
+    if (tp) tp.forEach((r) => {
+      const c = r.SecuritiesCompanyCode || r.Code || r.CompanyCode;
+      if (c) map[String(c).trim()] = parsePrice(r.Close != null ? r.Close : r.ClosingPrice);
+    });
+    if (!tw && !tp) {
+      setPriceStatus({ state: "err", msg: "抓取失敗（上市/上櫃來源與 CORS 代理皆無法連線），可改手動填入。" });
       return;
     }
-    const map = {};
-    const parsePrice = (v) => num(String(v == null ? "" : v).replace(/,/g, "")); // 去除千分位逗號
-    rows.forEach((r) => { if (r.Code) map[String(r.Code).trim()] = parsePrice(r.ClosingPrice); });
     let hit = 0, miss = [];
     setInstruments((arr) => arr.map((i) => {
       const key = String(i.ticker || "").trim();
@@ -359,10 +371,10 @@ function App() {
       if (key) miss.push(key);
       return i;
     }));
+    const srcLabel = tw && tp ? "上市+上櫃" : (tw ? "僅上市（上櫃來源失敗）" : "僅上櫃（上市來源失敗）");
     setPriceStatus({
       state: "ok",
-      msg: "已更新 " + hit + " 檔" + (usedVia ? "（經 CORS 代理）" : "")
-        + (miss.length ? "，查無：" + miss.join("、") + "（上櫃股或代號不在上市清單）" : ""),
+      msg: "已更新 " + hit + " 檔（" + srcLabel + "）" + (miss.length ? "，查無：" + miss.join("、") : ""),
     });
   };
 
@@ -569,7 +581,7 @@ function App() {
           </div>
           {priceStatus && priceStatus.state !== "loading" && (
             <div style={{ fontSize: 11, marginBottom: 8, color: priceStatus.state === "err" ? C.red : C.jade }}>
-              {priceStatus.msg} · 僅上市最近收盤價、非盤中即時
+              {priceStatus.msg} · 最近收盤價、非盤中即時
             </div>
           )}
 
