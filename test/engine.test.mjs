@@ -86,3 +86,17 @@ test('monteCarlo 同種子可重現', () => {
   const mk = () => monteCarlo({ instruments: INST1, mode: 'lump', budget: 1000, gross: 7, years: 10, sigma: 18, paths: 300, seed: 99 });
   assert.equal(mk().medianFinal, mk().medianFinal);
 });
+
+/* ---------- Task 2.1：HIST_RETURNS 歷史月報酬資料 ---------- */
+
+import { HIST_RETURNS } from '../engine.mjs';
+
+test('HIST_RETURNS: 長度與數值合理', () => {
+  assert.ok(Array.isArray(HIST_RETURNS.monthly), '需為陣列');
+  assert.ok(HIST_RETURNS.monthly.length >= 120, `長度 ${HIST_RETURNS.monthly.length} 應≥120`);
+  for (const r of HIST_RETURNS.monthly) assert.ok(Math.abs(r) < 0.5, `單月報酬 ${r} 異常`);
+  const m = HIST_RETURNS.monthly.reduce((s, x) => s + x, 0) / HIST_RETURNS.monthly.length;
+  assert.ok(m > 0 && m < 0.03, `月均 ${m} 不在合理區間`);
+  assert.ok(typeof HIST_RETURNS.range === 'string' && HIST_RETURNS.range.length > 0, '需標註區間');
+  assert.ok(typeof HIST_RETURNS.source === 'string' && HIST_RETURNS.source.length > 0, '需標註來源');
+});
