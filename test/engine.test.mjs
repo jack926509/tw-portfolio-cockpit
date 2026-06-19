@@ -229,20 +229,6 @@ test('solveContribution: target=0 → 0', () => {
   assert.equal(solveContribution({ instruments: INST1, sweepId: 'a', mode: 'lump', gross: 5, years: 10, target: 0 }), 0);
 });
 
-/* ---------- Task 6.3：toCsv（UTF-8 BOM） ---------- */
-
-import { toCsv } from '../engine.mjs';
-
-test('toCsv: 含 BOM、標頭、列數正確、含標的名稱欄', () => {
-  const series = [{ year: 0, total: 1000, invested: 1000, divSwept: 0, a: 1000 }, { year: 1, total: 1100, invested: 1000, divSwept: 0, a: 1100 }];
-  const inst = [{ id: 'a', name: '測試' }];
-  const csv = toCsv(series, inst);
-  assert.equal(csv.charCodeAt(0), 0xFEFF, '需 UTF-8 BOM');
-  const lines = csv.replace(/^﻿/, '').trim().split('\n');
-  assert.equal(lines.length, 3, `應 1 標頭 + 2 列，實際 ${lines.length}`);
-  assert.ok(lines[0].includes('年') && lines[0].includes('測試'), `標頭=${lines[0]}`);
-});
-
 /* ---------- Task 2.1：HIST_RETURNS 歷史月報酬資料 ---------- */
 
 import { HIST_RETURNS } from '../engine.mjs';
