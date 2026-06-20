@@ -661,10 +661,13 @@ function App() {
   }, [snapA, snapB]);
 
   // 歷史回測校驗：用實際歷史月報酬跑滾動視窗（不抽樣、不 recenter）。
-  const BT = useMemo(() => (backtest
-    ? historicalBacktest({ mode, budget, years })
-    : null),
-    [backtest, mode, budget, years]);
+  // 歷史長度有限（約 23 年），年期超過可用歷史時無法湊出任何完整視窗，會算出 NaN／0；
+  // 此時回 null，由 UI 提示縮短年期，避免顯示垃圾數字。
+  const BT = useMemo(() => {
+    if (!backtest) return null;
+    if (years * 12 > window.Engine.HIST_RETURNS.monthly.length) return null;
+    return historicalBacktest({ mode, budget, years });
+  }, [backtest, mode, budget, years]);
 
   // 圖表資料：把回測「最近一段實績」疊成 hist 線（與模擬機率帶同 year 對齊）。
   const chartData = useMemo(() => {
@@ -916,9 +919,12 @@ function App() {
   };
 
   // 規劃用統計：以目前模型的模擬結果（SIM）為準；達標/保本依模型取對應欄位。
+  // 取 series 最後一筆（期末）而非用 years 索引：SIM 以 deferred 的 dYears 計算，
+  // years 一變動會領先一個 render，用 SIM.series[years] 可能取到 undefined 而崩潰。
+  const simEnd = SIM ? SIM.series[SIM.series.length - 1] : null;
   const simStat = SIM ? {
     p50: SIM.medianFinal, mult: SIM.medianMultiple,
-    p10: SIM.series[years].p10, p90: SIM.series[years].p90,
+    p10: simEnd.p10, p90: simEnd.p90,
     success: model === "bootstrap" ? SIM.risk.successRate * 100 : SIM.aboveInvested,
   } : null;
 
@@ -1175,7 +1181,12 @@ function App() {
               {BT && (
                 <div style={{ fontSize: 11, color: C.muted, marginTop: 4, lineHeight: 1.6, background: "#F4F7FA", borderRadius: 8, padding: "8px 10px" }}>
                   <b style={{ color: C.ink }}>回測校驗</b>（綠線）：台股歷史 {window.Engine.HIST_RETURNS.range}，過去 {BT.windows} 段 {years} 年滾動視窗，實際期末中位 {fmtWan(BT.p50)}（區間 {fmtWan(BT.p10)} ～ {fmtWan(BT.p90)}）。
-                  最近一段實績 {fmtWan(BT.last.finalValue)}，{(BT.last.finalValue >= SIM.series[years].p10 && BT.last.finalValue <= SIM.series[years].p90) ? "落在" : "落在外側於"}模擬 P10–P90 機率帶。
+                  最近一段實績 {fmtWan(BT.last.finalValue)}，{(BT.last.finalValue >= simEnd.p10 && BT.last.finalValue <= simEnd.p90) ? "落在" : "落在外側於"}模擬 P10–P90 機率帶。
+                </div>
+              )}
+              {backtest && !BT && (
+                <div style={{ fontSize: 11, color: C.warn, marginTop: 4, lineHeight: 1.6, background: "#FFF6F2", borderRadius: 8, padding: "8px 10px" }}>
+                  回測校驗：可用台股歷史僅約 {Math.floor(window.Engine.HIST_RETURNS.monthly.length / 12)} 年（{window.Engine.HIST_RETURNS.range}），不足以回測 {years} 年；請把年期縮短到約 {Math.floor(window.Engine.HIST_RETURNS.monthly.length / 12)} 年內，或關閉回測校驗。
                 </div>
               )}
                 </div>
