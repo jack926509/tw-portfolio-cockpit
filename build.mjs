@@ -55,7 +55,11 @@ let out = html.replace(/\s*<script src="https?:\/\/[^"]*@babel\/standalone[^"]*"
 out = out.replace(/\s*<script type="module">import \* as E from "\.\/engine\.mjs";[^<]*<\/script>/, "");
 // __ENGINE_SRC__：引擎原始碼字串，供 App 建立 Web Worker（重模擬移出主執行緒）。
 const engineSrcScript = `<script>window.__ENGINE_SRC__=${JSON.stringify(engineCode)};</script>`;
-out = out.replace(babelRe, `<script>\n${engineCode}\n</script>\n${engineSrcScript}\n<script>\n${code}</script>`);
+// 用「函式替換」而非字串替換：String.replace 的字串形式會把編譯後 JS 中的 $&、$`、$'、$$
+// 等序列當成特殊替換樣式，導致原始 HTML 被回填、產出毀損（App script 變成語法錯誤而無法啟動）。
+// 函式回傳值則原樣插入，無此問題。
+const inlined = `<script>\n${engineCode}\n</script>\n${engineSrcScript}\n<script>\n${code}</script>`;
+out = out.replace(babelRe, () => inlined);
 
 await mkdir(OUT_DIR, { recursive: true });
 await writeFile(OUT, out, "utf8");
