@@ -66,6 +66,27 @@ test('simulate 配置正規化：合計≠100 仍按比例', () => {
   assert.ok(Math.abs(r.lookTsmc - 50) < 1e-6, `lookTsmc=${r.lookTsmc}`);
 });
 
+test('simulate 規劃輸入：每年投入成長會提高投入與期末值', () => {
+  const flat = simulate({ instruments: INST1, sweepId: 'a', mode: 'monthly', budget: 1000, gross: 0, years: 3 });
+  const growing = simulate({ instruments: INST1, sweepId: 'a', mode: 'monthly', budget: 1000, gross: 0, years: 3, contributionGrowth: 10 });
+  assert.ok(growing.invested > flat.invested, `growing invested=${growing.invested} flat=${flat.invested}`);
+  assert.ok(growing.finalTotal > flat.finalTotal, `growing final=${growing.finalTotal} flat=${flat.finalTotal}`);
+});
+
+test('simulate 規劃輸入：一次性加碼會計入投入與期末值', () => {
+  const base = simulate({ instruments: INST1, sweepId: 'a', mode: 'monthly', budget: 1000, gross: 0, years: 3 });
+  const bonus = simulate({ instruments: INST1, sweepId: 'a', mode: 'monthly', budget: 1000, gross: 0, years: 3, oneTimeYear: 2, oneTimeAmount: 50000 });
+  assert.equal(Math.round(bonus.invested - base.invested), 50000);
+  assert.equal(Math.round(bonus.finalTotal - base.finalTotal), 50000);
+});
+
+test('simulate 規劃輸入：退休提領會降低期末值', () => {
+  const base = simulate({ instruments: INST1, sweepId: 'a', mode: 'lump', budget: 1000000, gross: 0, years: 5 });
+  const draw = simulate({ instruments: INST1, sweepId: 'a', mode: 'lump', budget: 1000000, gross: 0, years: 5, withdrawalStartYear: 3, monthlyWithdrawal: 10000 });
+  assert.ok(draw.finalTotal < base.finalTotal, `draw=${draw.finalTotal} base=${base.finalTotal}`);
+  assert.ok(draw.withdrawn > 0, `withdrawn=${draw.withdrawn}`);
+});
+
 /* ---------- Task 1.4：monteCarlo GBM 對數常態 ---------- */
 
 test('monteCarlo σ=0：三分位重合且=simulate 期末（核心一致性）', () => {
@@ -85,6 +106,12 @@ test('monteCarlo cagrImplied = μ − σ²/2', () => {
 test('monteCarlo 同種子可重現', () => {
   const mk = () => monteCarlo({ instruments: INST1, mode: 'lump', budget: 1000, gross: 7, years: 10, sigma: 18, paths: 300, seed: 99 });
   assert.equal(mk().medianFinal, mk().medianFinal);
+});
+
+test('monteCarlo targetSuccess: 回傳期末達成目標比例', () => {
+  const mc = monteCarlo({ instruments: INST1, mode: 'monthly', budget: 1000, gross: 6, years: 10, sigma: 18, paths: 500, seed: 10, target: 500000 });
+  assert.ok(mc.targetSuccess >= 0 && mc.targetSuccess <= 100, `targetSuccess=${mc.targetSuccess}`);
+  assert.ok(mc.targetSuccess < mc.aboveInvested, `目標達成率 ${mc.targetSuccess} 應低於保本率 ${mc.aboveInvested}`);
 });
 
 /* ---------- Task 3.1：Student-t 抽樣（厚尾） ---------- */
@@ -225,6 +252,29 @@ test('solveContribution: 回推所需投入，代回 simulate 命中目標', () 
   assert.ok(Math.abs(back - 5000000) / 5000000 < 1e-6, `back=${back} need=${need}`);
 });
 
+test('solveContribution: 含股利稅門檻時仍命中目標', () => {
+  const two = [
+    { id: 's', ticker: 's', price: 10, alloc: 20, fee: 0, divYield: 0, tsmcW: 0, distributes: false, sigma: 18 },
+    { id: 'd', ticker: 'd', price: 10, alloc: 80, fee: 0, divYield: 8, tsmcW: 0, distributes: true, sigma: 18 },
+  ];
+  const args = { instruments: two, sweepId: 's', mode: 'monthly', gross: 7, years: 20, target: 20000000, tax: { supplement: true, divTaxRate: 28 } };
+  const need = solveContribution(args);
+  const back = simulate({ ...args, budget: need }).finalTotal;
+  assert.ok(Math.abs(back - args.target) / args.target < 1e-6, `back=${back} need=${need}`);
+});
+
+test('solveContribution: 一次性加碼會降低達標所需定期投入', () => {
+  const base = solveContribution({ instruments: INST1, sweepId: 'a', mode: 'monthly', gross: 5, years: 10, target: 2000000 });
+  const withBonus = solveContribution({ instruments: INST1, sweepId: 'a', mode: 'monthly', gross: 5, years: 10, target: 2000000, oneTimeYear: 3, oneTimeAmount: 300000 });
+  assert.ok(withBonus < base, `withBonus=${withBonus} base=${base}`);
+});
+
+test('solveContribution: 退休提領會提高達標所需定期投入', () => {
+  const base = solveContribution({ instruments: INST1, sweepId: 'a', mode: 'monthly', gross: 5, years: 15, target: 3000000 });
+  const withWithdrawal = solveContribution({ instruments: INST1, sweepId: 'a', mode: 'monthly', gross: 5, years: 15, target: 3000000, withdrawalStartYear: 10, monthlyWithdrawal: 20000 });
+  assert.ok(withWithdrawal > base, `withWithdrawal=${withWithdrawal} base=${base}`);
+});
+
 test('solveContribution: target=0 → 0', () => {
   assert.equal(solveContribution({ instruments: INST1, sweepId: 'a', mode: 'lump', gross: 5, years: 10, target: 0 }), 0);
 });
@@ -314,6 +364,12 @@ test('bootstrapSimulate: 期末中位數隨報酬假設提高而提高（recente
   const lo = bootstrapSimulate({ ...base, gross: 2 }).series[20].p50;
   const hi = bootstrapSimulate({ ...base, gross: 10 }).series[20].p50;
   assert.ok(hi > lo, `hi ${hi} 應 > lo ${lo}`);
+});
+
+test('bootstrapSimulate: target 會改變 successRate 為目標達成率', () => {
+  const base = bootstrapSimulate({ instruments: INST1, mode: 'monthly', budget: 1000, gross: 6, years: 10, paths: 400, seed: 8 });
+  const target = bootstrapSimulate({ instruments: INST1, mode: 'monthly', budget: 1000, gross: 6, years: 10, paths: 400, seed: 8, target: base.medianFinal * 1.5 });
+  assert.ok(target.risk.successRate < base.risk.successRate, `target=${target.risk.successRate} base=${base.risk.successRate}`);
 });
 
 /* ---------- Task 2.5：historicalBacktest 歷史滾動回測 ---------- */

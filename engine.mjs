@@ -66,12 +66,22 @@ export function applyDividendTax(div, { supplement = true, divTaxRate = 0, thres
 /* ---------- 確定性試算引擎（連續複利） ----------
    月成長率採連續複利 exp(a/12)-1，使「年化報酬 a、t 年」單筆期末
    恰為 本金·e^(a·t)；σ=0 的蒙地卡羅亦由此貼齊（核心一致性）。     */
-export function simulate({ instruments, mode, budget, gross, years, sweepId, tax = null }) {
+export function simulate({
+  instruments, mode, budget, gross, years, sweepId, tax = null,
+  contributionGrowth = 0, oneTimeYear = 0, oneTimeAmount = 0,
+  rebalance = "none", withdrawalStartYear = 0, monthlyWithdrawal = 0,
+}) {
   const list = instruments;
   const sumAlloc = list.reduce((s, i) => s + Math.max(0, +i.alloc || 0), 0) || 1;
+  const weight = (i) => Math.max(0, +i.alloc || 0) / sumAlloc;
   const amt = {};
-  list.forEach((i) => (amt[i.id] = (budget * Math.max(0, +i.alloc || 0)) / sumAlloc));
+  list.forEach((i) => (amt[i.id] = budget * weight(i)));
   const validSweep = list.some((i) => i.id === sweepId) ? sweepId : null;
+  const growth = num(contributionGrowth) / 100;
+  const bonusYear = Math.max(0, Math.round(num(oneTimeYear)));
+  const bonusAmount = num(oneTimeAmount);
+  const withdrawFromMonth = Math.max(0, Math.round(num(withdrawalStartYear))) > 0 ? (Math.round(num(withdrawalStartYear)) - 1) * 12 + 1 : Infinity;
+  const monthlyDraw = num(monthlyWithdrawal);
 
   const mrate = (annual) => Math.exp(annual / 100 / 12) - 1;   // 連續複利月率
   const netRate = (i) => {
@@ -89,16 +99,38 @@ export function simulate({ instruments, mode, budget, gross, years, sweepId, tax
   const months = years * 12;
   const total = () => list.reduce((s, i) => s + bal[i.id], 0);
   const snap = () => { const o = {}; list.forEach((i) => (o[i.id] = bal[i.id])); return o; };
+  const addAllocated = (cash) => {
+    if (!(cash > 0)) return;
+    list.forEach((i) => { bal[i.id] += cash * weight(i); });
+  };
+  const withdrawProportionally = (cash) => {
+    const t = total();
+    const take = Math.min(cash, t);
+    if (!(take > 0) || !(t > 0)) return 0;
+    list.forEach((i) => { bal[i.id] = Math.max(0, bal[i.id] - take * (bal[i.id] / t)); });
+    return take;
+  };
+  const rebalanceToTarget = () => {
+    const t = total();
+    list.forEach((i) => { bal[i.id] = t * weight(i); });
+  };
 
   let invested = mode === "lump" ? budget : 0;
-  const series = [{ year: 0, total: total(), invested, divSwept: 0, ...snap() }];
+  let withdrawn = 0;
+  const series = [{ year: 0, total: total(), invested, withdrawn, divSwept: 0, ...snap() }];
 
   for (let m = 1; m <= months; m++) {
+    const currentBudget = mode === "monthly" ? budget * Math.pow(1 + growth, Math.floor((m - 1) / 12)) : 0;
     list.forEach((i) => {
-      if (mode === "monthly") bal[i.id] += amt[i.id];
+      if (mode === "monthly") bal[i.id] += currentBudget * weight(i);
       bal[i.id] *= 1 + monthly[i.id];
     });
-    if (mode === "monthly") invested += budget;
+    if (mode === "monthly") invested += currentBudget;
+    if (bonusAmount > 0 && bonusYear > 0 && m === (bonusYear - 1) * 12 + 1) {
+      addAllocated(bonusAmount);
+      invested += bonusAmount;
+    }
+    if (m >= withdrawFromMonth && monthlyDraw > 0) withdrawn += withdrawProportionally(monthlyDraw);
     if (m % 12 === 0) {
       let swept = 0;
       list.forEach((i) => {
@@ -109,7 +141,8 @@ export function simulate({ instruments, mode, budget, gross, years, sweepId, tax
           if (validSweep) bal[validSweep] += d;
         }
       });
-      series.push({ year: m / 12, total: total(), invested, divSwept: swept, ...snap() });
+      if (rebalance === "annual") rebalanceToTarget();
+      series.push({ year: m / 12, total: total(), invested, withdrawn, divSwept: swept, ...snap() });
     }
   }
 
@@ -119,18 +152,34 @@ export function simulate({ instruments, mode, budget, gross, years, sweepId, tax
     const sh = i.price > 0 ? Math.floor(a / i.price) : 0;
     return { ...i, amount: a, shares: sh, cost: sh * i.price, leftover: a - sh * i.price };
   });
-  return { series, lookTsmc, buys, finalTotal: total(), invested };
+  return { series, lookTsmc, buys, finalTotal: total(), invested, withdrawn };
 }
 
 /* ---------- 目標金額回推 ----------
-   simulate 的期末對「投入金額」為線性（各標的金額、月扣款、股利掃入皆線性於 budget），
-   故以單位投入（budget=1）跑一次取得每元期末值，再線性回推所需投入 = target / 每元期末值。
-   回傳達成 target 所需的每月（或單筆）投入金額；target≤0 回 0。            */
-export function solveContribution({ instruments, mode, gross, years, sweepId, target, tax = null }) {
+   回傳達成 target 所需的每月（或單筆）投入金額；target≤0 回 0。
+   未含門檻規則時，期末值大致線性於投入；但二代健保補充保費有單筆股利門檻，
+   含稅時會變成分段非線性，因此用二分搜尋代回 simulate，避免低估所需投入。 */
+export function solveContribution({
+  instruments, mode, gross, years, sweepId, target, tax = null,
+  contributionGrowth = 0, oneTimeYear = 0, oneTimeAmount = 0,
+  rebalance = "none", withdrawalStartYear = 0, monthlyWithdrawal = 0,
+}) {
   const t = Math.max(0, +target || 0);
   if (t === 0) return 0;
-  const perUnit = simulate({ instruments, mode, budget: 1, gross, years, sweepId, tax }).finalTotal;
-  return perUnit > 0 ? t / perUnit : 0;
+  const finalAt = (budget) => simulate({
+    instruments, mode, budget, gross, years, sweepId, tax,
+    contributionGrowth, oneTimeYear, oneTimeAmount, rebalance, withdrawalStartYear, monthlyWithdrawal,
+  }).finalTotal;
+  if (finalAt(0) >= t) return 0;
+  let lo = 0;
+  let hi = Math.max(1, t);
+  while (finalAt(hi) < t && hi < Number.MAX_SAFE_INTEGER / 2) hi *= 2;
+  for (let i = 0; i < 80; i++) {
+    const mid = (lo + hi) / 2;
+    if (finalAt(mid) >= t) hi = mid;
+    else lo = mid;
+  }
+  return hi;
 }
 
 /* ---------- 蒙地卡羅引擎（逐標的、單因子等相關、GBM 對數常態） ----------
@@ -141,7 +190,11 @@ export function solveContribution({ instruments, mode, gross, years, sweepId, ta
    - 對數常態本身 ≥0，無需截斷。dist='t' 時 z0/z_i 改用標準化 Student-t（厚尾），σ 意義不變。
    - 投組幾何報酬 cagrImplied = μ_p − σ_p²/2，σ_p² 由等相關共變異數矩陣求得。
    - 接受可注入 seed，確保可重現。                                              */
-export function monteCarlo({ instruments, mode, budget, gross, years, sigma, paths, seed, dist = "normal", nu = 5, rho = 0.7 }) {
+export function monteCarlo({
+  instruments, mode, budget, gross, years, sigma, paths, seed, dist = "normal", nu = 5, rho = 0.7, target,
+  contributionGrowth = 0, oneTimeYear = 0, oneTimeAmount = 0,
+  rebalance = "none", withdrawalStartYear = 0, monthlyWithdrawal = 0,
+}) {
   const list = instruments;
   const n = list.length;
   const sumAlloc = list.reduce((s, i) => s + num(i.alloc), 0) || 1;
@@ -156,7 +209,18 @@ export function monteCarlo({ instruments, mode, budget, gross, years, sigma, pat
   const N = Math.max(1, Math.round(paths));
 
   const startW = mode === "lump" ? budget : 0;
-  const contrib = mode === "monthly" ? budget : 0;
+  const growth = num(contributionGrowth) / 100;
+  const bonusYear = Math.max(0, Math.round(num(oneTimeYear)));
+  const bonusAmount = num(oneTimeAmount);
+  const withdrawFromMonth = Math.max(0, Math.round(num(withdrawalStartYear))) > 0 ? (Math.round(num(withdrawalStartYear)) - 1) * 12 + 1 : Infinity;
+  const monthlyDraw = num(monthlyWithdrawal);
+  const investedAtYear = (y) => {
+    if (mode === "lump") return budget + (bonusYear > 0 && bonusYear <= y ? bonusAmount : 0);
+    let s = 0;
+    for (let m = 1; m <= y * 12; m++) s += budget * Math.pow(1 + growth, Math.floor((m - 1) / 12));
+    if (bonusYear > 0 && bonusYear <= y) s += bonusAmount;
+    return s;
+  };
   const rng = makeRng(seed != null ? seed : 1234567);
   const useT = dist === "t";
   let g = null;   // 常態 gaussianPair 一次給兩個，交替使用以免浪費
@@ -173,26 +237,38 @@ export function monteCarlo({ instruments, mode, budget, gross, years, sigma, pat
     yearVals[0][p] = startW;
     for (let m = 1; m <= months; m++) {
       const z0 = draw();                                  // 共同市場因子
+      const contrib = mode === "monthly" ? budget * Math.pow(1 + growth, Math.floor((m - 1) / 12)) : 0;
       for (let k = 0; k < n; k++) {
         bal[k] += contrib * w[k];
+        if (bonusAmount > 0 && bonusYear > 0 && m === (bonusYear - 1) * 12 + 1) bal[k] += bonusAmount * w[k];
         const eps = sigM[k] * (rt * z0 + ri * draw());    // 個股 = 共同 + 獨立
         bal[k] *= Math.exp(driftM[k] + eps);
       }
-      if (m % 12 === 0) { let tot = 0; for (let k = 0; k < n; k++) tot += bal[k]; yearVals[m / 12][p] = tot; }
+      if (m >= withdrawFromMonth && monthlyDraw > 0) {
+        let tot = 0; for (let k = 0; k < n; k++) tot += bal[k];
+        const take = Math.min(monthlyDraw, tot);
+        if (take > 0 && tot > 0) for (let k = 0; k < n; k++) bal[k] = Math.max(0, bal[k] - take * (bal[k] / tot));
+      }
+      if (m % 12 === 0) {
+        let tot = 0; for (let k = 0; k < n; k++) tot += bal[k];
+        if (rebalance === "annual" && tot > 0) for (let k = 0; k < n; k++) bal[k] = tot * w[k];
+        yearVals[m / 12][p] = tot;
+      }
     }
   }
 
-  const invested = mode === "lump" ? budget : budget * months;
+  const invested = investedAtYear(years);
   const series = yearVals.map((arr, y) => {
     const sorted = Float64Array.prototype.slice.call(arr).sort((a, b) => a - b);
     const p10 = quantile(sorted, 0.10), p50 = quantile(sorted, 0.50), p90 = quantile(sorted, 0.90);
     // band 為 [低, 高] 兩元素陣列，Recharts Area 會渲染成 P10–P90 機率帶
-    return { year: y, p10, p50, p90, band: [p10, p90], invested: mode === "lump" ? budget : budget * y * 12 };
+    return { year: y, p10, p50, p90, band: [p10, p90], invested: investedAtYear(y) };
   });
   const finals = Float64Array.prototype.slice.call(yearVals[years]).sort((a, b) => a - b);
   const medianFinal = quantile(finals, 0.50);
   const aboveInvested = (yearVals[years].reduce((s, v) => s + (v >= invested ? 1 : 0), 0) / N) * 100;
   const aboveDouble = (yearVals[years].reduce((s, v) => s + (v >= invested * 2 ? 1 : 0), 0) / N) * 100;
+  const targetSuccess = target != null ? (yearVals[years].reduce((s, v) => s + (v >= target ? 1 : 0), 0) / N) * 100 : null;
   // 投組算術年報酬與等相關變異數：σ_p² = (1−ρ)Σwᵢ²σᵢ² + ρ(Σwᵢσᵢ)²
   const muP = list.reduce((s, _, k) => s + w[k] * ((gross - num(list[k].fee)) / 100), 0);
   const sumW2S2 = list.reduce((s, _, k) => s + w[k] * w[k] * sigA[k] * sigA[k], 0);
@@ -200,7 +276,7 @@ export function monteCarlo({ instruments, mode, budget, gross, years, sigma, pat
   const varP = (1 - r) * sumW2S2 + r * sumWS * sumWS;
   const cagrImplied = (muP - varP / 2) * 100; // 波動拖累後的幾何年報酬
 
-  return { series, invested, medianFinal, medianMultiple: invested ? medianFinal / invested : 0, aboveInvested, aboveDouble, cagrImplied, paths: N };
+  return { series, invested, medianFinal, medianMultiple: invested ? medianFinal / invested : 0, aboveInvested, aboveDouble, targetSuccess, cagrImplied, paths: N };
 }
 
 /* ---------- CAPE 估值調整：盈餘殖利率 ≈ 長期報酬粗估 ----------
@@ -239,7 +315,11 @@ export function stationaryBootstrap({ pool, months, paths, avgBlock, recenterTo 
    以 HIST_RETURNS 月報酬為 pool 做平穩拔靴，但用 recenterTo 把均值平移到使用者的報酬假設
    （μ = gross − 配置加權內扣，視為算術年報酬），故借用歷史的波動結構/厚尾/序列相依，
    不強加歷史的高報酬。回傳與 monteCarlo 同形 series（year/p10/p50/p90/band/invested）＋ risk。 */
-export function bootstrapSimulate({ instruments, mode, budget, gross, years, paths, avgBlock = 6, seed, target }) {
+export function bootstrapSimulate({
+  instruments, mode, budget, gross, years, paths, avgBlock = 6, seed, target,
+  contributionGrowth = 0, oneTimeYear = 0, oneTimeAmount = 0,
+  withdrawalStartYear = 0, monthlyWithdrawal = 0,
+}) {
   const list = instruments;
   const sumAlloc = list.reduce((s, i) => s + num(i.alloc), 0) || 1;
   const wFee = list.reduce((s, i) => s + (num(i.alloc) / sumAlloc) * num(i.fee), 0);
@@ -252,7 +332,18 @@ export function bootstrapSimulate({ instruments, mode, budget, gross, years, pat
   const samples = stationaryBootstrap({ pool: HIST_RETURNS.monthly, months, paths: N, avgBlock, recenterTo, rng });
 
   const start = mode === "lump" ? budget : 0;
-  const contrib = mode === "monthly" ? budget : 0;
+  const growth = num(contributionGrowth) / 100;
+  const bonusYear = Math.max(0, Math.round(num(oneTimeYear)));
+  const bonusAmount = num(oneTimeAmount);
+  const withdrawFromMonth = Math.max(0, Math.round(num(withdrawalStartYear))) > 0 ? (Math.round(num(withdrawalStartYear)) - 1) * 12 + 1 : Infinity;
+  const monthlyDraw = num(monthlyWithdrawal);
+  const investedAtYear = (y) => {
+    if (mode === "lump") return budget + (bonusYear > 0 && bonusYear <= y ? bonusAmount : 0);
+    let s = 0;
+    for (let m = 1; m <= y * 12; m++) s += budget * Math.pow(1 + growth, Math.floor((m - 1) / 12));
+    if (bonusYear > 0 && bonusYear <= y) s += bonusAmount;
+    return s;
+  };
 
   // 各路徑：逐月套用報酬，記錄各年底資產值（年值序列亦供回撤計算）
   const yearVals = Array.from({ length: years + 1 }, () => new Float64Array(N));
@@ -262,8 +353,11 @@ export function bootstrapSimulate({ instruments, mode, budget, gross, years, pat
     const row = samples[p];
     const yp = new Array(years + 1); yp[0] = bal; yearVals[0][p] = bal;
     for (let m = 1; m <= months; m++) {
+      const contrib = mode === "monthly" ? budget * Math.pow(1 + growth, Math.floor((m - 1) / 12)) : 0;
       bal += contrib;
+      if (bonusAmount > 0 && bonusYear > 0 && m === (bonusYear - 1) * 12 + 1) bal += bonusAmount;
       bal *= 1 + row[m - 1];
+      if (m >= withdrawFromMonth && monthlyDraw > 0) bal = Math.max(0, bal - monthlyDraw);
       if (bal < 0) bal = 0;                          // 月報酬理論下限 -100%
       if (m % 12 === 0) { yearVals[m / 12][p] = bal; yp[m / 12] = bal; }
     }
@@ -273,10 +367,10 @@ export function bootstrapSimulate({ instruments, mode, budget, gross, years, pat
   const series = yearVals.map((arr, y) => {
     const sorted = Float64Array.prototype.slice.call(arr).sort((a, b) => a - b);
     const p10 = quantile(sorted, 0.10), p50 = quantile(sorted, 0.50), p90 = quantile(sorted, 0.90);
-    return { year: y, p10, p50, p90, band: [p10, p90], invested: mode === "lump" ? budget : budget * y * 12 };
+    return { year: y, p10, p50, p90, band: [p10, p90], invested: investedAtYear(y) };
   });
 
-  const invested = mode === "lump" ? budget : budget * months;
+  const invested = investedAtYear(years);
   const finalsArr = Float64Array.prototype.slice.call(yearVals[years]);
   const finalsSorted = finalsArr.slice().sort((a, b) => a - b);
   const medianFinal = quantile(finalsSorted, 0.50);

@@ -23,7 +23,23 @@
   .section-title{font-size:15px;font-weight:700;color:#14181F;letter-spacing:-.01em}
   .btn{cursor:pointer;border:1px solid #E2E6EC;background:#fff;border-radius:9px;padding:7px 13px;font-size:12.5px;color:#14181F;display:inline-flex;align-items:center;gap:6px;transition:background .12s,border-color .12s}
   .btn:hover{background:#F4F6F9;border-color:#D6DBE4}
-  @media (max-width:680px){ .grid2{grid-template-columns:1fr !important} .hidemob{display:none} }
+  .mobile-instruments{display:none}
+  .mobile-only{display:none}
+  .help-copy{font-size:11px;color:#6B7480;margin-top:8px;line-height:1.6}
+  @media (max-width:680px){
+    .app-shell{padding:14px 10px !important}
+    .app-wrap{max-width:none !important}
+    .card{border-radius:12px !important;padding:14px !important;margin-bottom:10px !important}
+    .btn{min-height:42px;justify-content:center}
+    .top-actions,.mobile-actions{width:100%;display:grid !important;grid-template-columns:1fr 1fr;gap:8px !important}
+    .grid2{grid-template-columns:1fr !important}
+    .stat-grid{grid-template-columns:repeat(2,minmax(0,1fr)) !important;gap:12px !important}
+    .hidemob,.desktop-table{display:none !important}
+    .mobile-instruments{display:flex;flex-direction:column;gap:10px}
+    .mobile-only{display:inline-flex}
+    .help-copy{display:none}
+    .mobile-help-open{display:block}
+  }
   /* 載入中提示 */
   .boot{font-family:var(--sans);color:#6B7480;font-size:14px;display:flex;height:60vh;align-items:center;justify-content:center}
 </style>
@@ -199,8 +215,12 @@ const DEFAULT_STATE = {
   model: "bootstrap", backtest: false,
   dist: "normal", nu: 5, rho: 0.7, cape: 0,
   taxOn: false, divTaxRate: 28, realView: false, infl: 2,
-  targetAmt: 0,
+  targetAmt: 0, targetYears: 20,
+  contributionGrowth: 0, oneTimeYear: 0, oneTimeAmount: 0,
+  rebalance: "none", withdrawalStartYear: 0, monthlyWithdrawal: 0,
 };
+const clampTargetYears = (v, fallback = DEFAULT_STATE.targetYears) =>
+  Math.min(50, Math.max(1, Math.round(num(v, 1)) || fallback));
 
 /* 情境預設：一鍵套用報酬假設與參數化分布／相關設定。
    保守＝低報酬高相關＋厚尾；中性＝歷史中庸；樂觀＝高報酬低相關。 */
@@ -218,6 +238,20 @@ const PLAN_TEMPLATES = {
   積極: { gross: 9, weights: { core: 50, satellite: 30, stock: 20 }, blurb: "核心＋主動＋個股，追求較高報酬、波動也較大，需扛得住下跌。" },
 };
 const PLAN_ORDER = ["保守", "穩健", "積極"];
+const PLAN_GOALS = [
+  { id: "wealth", title: "長期累積資產", desc: "重點看期末資產區間、保本率與配置是否分散。" },
+  { id: "target", title: "達成指定金額", desc: "重點看目標差距、需要投入多少，以及達標機率。" },
+  { id: "retirement", title: "退休提領準備", desc: "重點看提領開始後，資產是否還能維持到期末。" },
+];
+
+function describePlanExtras(extras = {}, mode = "monthly") {
+  const out = [];
+  if (num(extras.contributionGrowth) > 0 && mode === "monthly") out.push(`每年投入提高 ${num(extras.contributionGrowth).toFixed(1)}%`);
+  if (num(extras.oneTimeYear) > 0 && num(extras.oneTimeAmount) > 0) out.push(`第 ${Math.round(num(extras.oneTimeYear))} 年一次加碼 ${fmtNT(num(extras.oneTimeAmount))}`);
+  if (extras.rebalance === "annual") out.push("每年底調回目標配置");
+  if (num(extras.withdrawalStartYear) > 0 && num(extras.monthlyWithdrawal) > 0) out.push(`第 ${Math.round(num(extras.withdrawalStartYear))} 年起每月提領 ${fmtNT(num(extras.monthlyWithdrawal))}`);
+  return out;
+}
 
 /* 依類別權重把 100% 配置攤到使用者目前的標的：
    1) 只保留「實際有標的」的類別權重，並重新正規化到 100（缺的類別權重併回其餘）。
@@ -292,6 +326,13 @@ function sanitizeState(d) {
     realView: !!d.realView,
     infl: num(d.infl),
     targetAmt: num(d.targetAmt),
+    targetYears: clampTargetYears(d.targetYears),
+    contributionGrowth: Math.min(30, Math.max(0, num(d.contributionGrowth))),
+    oneTimeYear: Math.min(50, Math.max(0, Math.round(num(d.oneTimeYear)))),
+    oneTimeAmount: num(d.oneTimeAmount),
+    rebalance: d.rebalance === "annual" ? "annual" : "none",
+    withdrawalStartYear: Math.min(80, Math.max(0, Math.round(num(d.withdrawalStartYear)))),
+    monthlyWithdrawal: num(d.monthlyWithdrawal),
   };
 }
 
@@ -330,9 +371,10 @@ function AddInstrumentPrompt({ onConfirm, onClose }) {
 }
 
 /* ---------- 投資計劃精靈：4 問 → 計劃書（即時試算、一鍵套用） ---------- */
-function PlanWizard({ instruments, mode, budget, years, onApply, onClose }) {
+function PlanWizard({ instruments, mode, budget, years, planExtras = {}, onApply, onClose }) {
   const [step, setStep] = useState(0);
-  const [ans, setAns] = useState({ mode, budget: budget || 15000, years: years || 20, profile: "穩健", target: 0 });
+  const hasWithdrawalPlan = num(planExtras.withdrawalStartYear) > 0 && num(planExtras.monthlyWithdrawal) > 0;
+  const [ans, setAns] = useState({ mode, budget: budget || 15000, years: years || 20, profile: "穩健", goal: hasWithdrawalPlan ? "retirement" : "wealth", target: 0 });
   const set = (k, v) => setAns((a) => ({ ...a, [k]: v }));
   const TOTAL = 4; // 步驟 0..3 為提問，步驟 4 為計劃書
 
@@ -344,7 +386,7 @@ function PlanWizard({ instruments, mode, budget, years, onApply, onClose }) {
     const t = PLAN_TEMPLATES[ans.profile];
     const a = allocateByCategory(instruments, t.weights);
     if (!a.instruments.length) return null;
-    const common = { instruments: a.instruments, mode: ans.mode, budget: num(ans.budget), gross: t.gross, years: ans.years, sweepId: a.sweepId };
+    const common = { instruments: a.instruments, mode: ans.mode, budget: num(ans.budget), gross: t.gross, years: ans.years, sweepId: a.sweepId, ...planExtras };
     const R = simulate({ ...common, tax: null });
     const BS = bootstrapSimulate({ ...common, paths: 800, avgBlock: 6 });
     const need = num(ans.target) > 0 ? solveContribution({ ...common, target: num(ans.target), tax: null }) : 0;
@@ -359,9 +401,10 @@ function PlanWizard({ instruments, mode, budget, years, onApply, onClose }) {
       t, allocated: a.instruments, sweepId: a.sweepId, sweepName, curMap, invested: R.invested,
       p50: BS.medianFinal, p10: last.p10, p90: last.p90, mult: BS.medianMultiple,
       success: BS.risk.successRate * 100, maxDD: BS.risk.maxDrawdownP90 * 100, cvar: BS.risk.cvar05,
+      cashflowNotes: describePlanExtras(planExtras, ans.mode),
       need, feeAvg, hasCore: a.instruments.some((i) => i.category === "core"),
     };
-  }, [instruments, ans, step]);
+  }, [instruments, ans, step, planExtras]);
 
   const next = () => setStep((s) => Math.min(TOTAL, s + 1));
   const prev = () => setStep((s) => Math.max(0, s - 1));
@@ -395,7 +438,7 @@ function PlanWizard({ instruments, mode, budget, years, onApply, onClose }) {
 
       {step === 1 && (
         <div>
-          <Qhead n={1} title="打算投資多久？" sub="時間是複利最大的朋友。年期拉長，達標率與期末區間通常明顯改善。" />
+          <Qhead n={1} title="打算投資多久？" sub="時間是複利最大的朋友。年期拉長，保本率與期末區間通常明顯改善。" />
           <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
             {[10, 20, 30].map((y) => (
               <button key={y} className="btn" onClick={() => set("years", y)}
@@ -430,7 +473,18 @@ function PlanWizard({ instruments, mode, budget, years, onApply, onClose }) {
 
       {step === 3 && (
         <div>
-          <Qhead n={3} title="有特定的目標金額嗎？（選填）" sub="例如想存到第一桶金或退休準備；留空＝沒有特定目標，只看推估區間。" />
+          <Qhead n={3} title="這份計劃主要用在哪個情境？" sub="情境會影響計劃書的解讀重點；目標金額可選填，填了會額外反推需要投入多少。" />
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
+            {PLAN_GOALS.map((g) => {
+              const on = ans.goal === g.id;
+              return (
+                <button key={g.id} onClick={() => set("goal", g.id)} style={{ textAlign: "left", cursor: "pointer", borderRadius: 10, padding: "10px 12px", border: "1.5px solid " + (on ? C.blue : C.border), background: on ? "#F2F7FF" : "#fff" }}>
+                  <div style={{ fontSize: 13.5, fontWeight: 700, color: on ? C.blue : C.ink }}>{g.title}</div>
+                  <div style={{ fontSize: 11.5, color: C.muted, marginTop: 3, lineHeight: 1.5 }}>{g.desc}</div>
+                </button>
+              );
+            })}
+          </div>
           <label style={{ fontSize: 12, color: C.muted, display: "flex", flexDirection: "column", gap: 6 }}>
             目標金額 (NT$)
             <input autoFocus className="num" type="number" min="0" step="100000" value={ans.target}
@@ -452,14 +506,23 @@ function PlanWizard({ instruments, mode, budget, years, onApply, onClose }) {
                 以<b>{ans.mode === "monthly" ? "每月 " + fmtNT(num(ans.budget)) : "單筆 " + fmtNT(num(ans.budget))}</b>、年化報酬假設 <b>{plan.t.gross}%</b>，持續投入 <b>{ans.years}</b> 年；
                 配置以核心市值ETF為底、依「{ans.profile}」配重，配息標的的現金股利每年掃入複利目標滾入再投資。
               </div>
+              {/* ①-b 情境與現金流 */}
+              <div style={{ fontSize: 12.5, lineHeight: 1.7, border: "1px solid " + C.border, borderRadius: 10, padding: "10px 12px" }}>
+                <b>情境重點</b>：{(PLAN_GOALS.find((g) => g.id === ans.goal) || PLAN_GOALS[0]).title}。
+                {plan.cashflowNotes.length ? (
+                  <div style={{ marginTop: 6, color: C.muted }}>已納入：{plan.cashflowNotes.join("、")}。</div>
+                ) : (
+                  <div style={{ marginTop: 6, color: C.muted }}>未啟用投入成長、加碼、退休提領或年度再平衡，計劃以固定投入為主。</div>
+                )}
+              </div>
               {/* ② 預期成果 */}
               <div>
                 <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>預期成果（{ans.years} 年後）</div>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 }}>
+                <div className="stat-grid" style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 }}>
                   <Stat label="累計投入" val={fmtWan(plan.invested)} sub={fmtNT(plan.invested)} />
                   <Stat label="中位數 (P50)" val={fmtWan(plan.p50)} sub={"成長 " + plan.mult.toFixed(2) + "×"} color={C.red} />
                   <Stat label="區間 P10–P90" val={fmtWan(plan.p10)} sub={"～ " + fmtWan(plan.p90)} color={C.warn} />
-                  <Stat label="達標率" val={plan.success.toFixed(0) + "%"} sub="期末 ≥ 投入本金" color={C.blue} />
+                  <Stat label="保本率" val={plan.success.toFixed(0) + "%"} sub="期末 ≥ 投入本金" color={C.blue} />
                 </div>
               </div>
               {/* 目標達成 */}
@@ -508,8 +571,14 @@ function PlanWizard({ instruments, mode, budget, years, onApply, onClose }) {
                 <b style={{ color: C.jade }}>讓股利滾雪球</b>：把配息標的每年領到的現金股利，自動「掃入」一檔不配息的核心市值ETF（例如 {plan.sweepName || "009816"}）持續再投資，零散股利就會變成不中斷的複利，是長期累積最省力的好習慣，建議優先採用。
               </div>
               {/* ⑤ 每月行動 */}
-              <div style={{ fontSize: 12.5, lineHeight: 1.8 }}>
-                <b>每月行動</b>：①固定日定期定額，市場漲跌都照買；②配息標的的股利讓系統自動掃入複利目標再投資；③一年檢視一次配置與內扣即可，不必盯盤。
+              <div style={{ fontSize: 12.5, lineHeight: 1.8, background: "#F4F7FA", borderRadius: 10, padding: "12px 14px" }}>
+                <b>下一步行動</b>
+                <ol style={{ margin: "6px 0 0 18px", padding: 0 }}>
+                  <li>{ans.mode === "monthly" ? "設定固定扣款日，先以每月 " + fmtNT(num(ans.budget)) + " 執行。" : "確認單筆資金可承受風險，再依建議配置分批或一次投入。"}</li>
+                  <li>把「配置對照」中差距最大的標的先調整，避免一次改太多造成判斷混亂。</li>
+                  <li>每年底檢查一次配置、內扣費用與目標差距；若收入提高，再回來調整每年投入成長或加碼金額。</li>
+                  {ans.goal === "retirement" && <li>退休提領情境要定期檢查 P10 與最差 5% 情境，避免只看中位數。</li>}
+                </ol>
               </div>
               {/* ⑥ 免責 */}
               <div style={{ fontSize: 10.5, color: C.faint, lineHeight: 1.6 }}>
@@ -558,6 +627,13 @@ function App() {
   const [realView, setRealView] = useState(false);   // 以實質購買力（平減通膨）顯示
   const [infl, setInfl] = useState(2);               // 年通膨率%
   const [targetAmt, setTargetAmt] = useState(0);     // 目標金額（回推所需投入），0＝不啟用
+  const [targetYears, setTargetYears] = useState(20); // 目標達成年期（回推專用，獨立於全域年期）
+  const [contributionGrowth, setContributionGrowth] = useState(0); // 每年投入成長率%
+  const [oneTimeYear, setOneTimeYear] = useState(0); // 一次性加碼年份，0＝不啟用
+  const [oneTimeAmount, setOneTimeAmount] = useState(0); // 一次性加碼金額
+  const [rebalance, setRebalance] = useState("none"); // 'none' | 'annual'
+  const [withdrawalStartYear, setWithdrawalStartYear] = useState(0); // 第幾年開始退休提領，0＝不啟用
+  const [monthlyWithdrawal, setMonthlyWithdrawal] = useState(0); // 退休後每月提領
   const [snapA, setSnapA] = useState(null);          // 情境比較快照 A
   const [snapB, setSnapB] = useState(null);          // 情境比較快照 B
   const [showDetail, setShowDetail] = useState(false); // 年度明細表是否展開
@@ -567,6 +643,7 @@ function App() {
   const fetchedRef = useRef({});                          // 各列已自動抓過的代號，避免重複抓
   const [addOpen, setAddOpen] = useState(false);         // 新增標的彈框是否開啟
   const [planOpen, setPlanOpen] = useState(false);       // 投資計劃精靈是否開啟
+  const [showInstrumentHelp, setShowInstrumentHelp] = useState(false); // 手機上收合標的說明
 
   const applyState = (s) => {
     setInstruments(s.instruments); setMode(s.mode); setBudget(s.budget);
@@ -575,7 +652,9 @@ function App() {
     setModel(s.model); setBacktest(s.backtest);
     setDist(s.dist); setNu(s.nu); setRho(s.rho); setCape(s.cape);
     setTaxOn(s.taxOn); setDivTaxRate(s.divTaxRate); setRealView(s.realView); setInfl(s.infl);
-    setTargetAmt(s.targetAmt);
+    setTargetAmt(s.targetAmt); setTargetYears(s.targetYears);
+    setContributionGrowth(s.contributionGrowth); setOneTimeYear(s.oneTimeYear); setOneTimeAmount(s.oneTimeAmount);
+    setRebalance(s.rebalance); setWithdrawalStartYear(s.withdrawalStartYear); setMonthlyWithdrawal(s.monthlyWithdrawal);
   };
 
   // 套用情境預設：設定毛報酬與參數化分布／相關，並切到參數化模式方便對照。
@@ -594,13 +673,14 @@ function App() {
 
   useEffect(() => {
     if (!loaded) return;
-    try { localStorage.setItem(STORE_KEY, JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, showAdv, model, backtest, dist, nu, rho, cape, taxOn, divTaxRate, realView, infl, targetAmt })); }
+    try { localStorage.setItem(STORE_KEY, JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, showAdv, model, backtest, dist, nu, rho, cape, taxOn, divTaxRate, realView, infl, targetAmt, targetYears, contributionGrowth, oneTimeYear, oneTimeAmount, rebalance, withdrawalStartYear, monthlyWithdrawal })); }
     catch (e) { /* 忽略 */ }
-  }, [instruments, mode, budget, gross, years, sweepId, sigma, paths, showAdv, model, backtest, dist, nu, rho, cape, taxOn, divTaxRate, realView, infl, targetAmt, loaded]);
+  }, [instruments, mode, budget, gross, years, sweepId, sigma, paths, showAdv, model, backtest, dist, nu, rho, cape, taxOn, divTaxRate, realView, infl, targetAmt, targetYears, contributionGrowth, oneTimeYear, oneTimeAmount, rebalance, withdrawalStartYear, monthlyWithdrawal, loaded]);
 
   const tax = taxOn ? { supplement: true, divTaxRate } : null;
-  const R = useMemo(() => simulate({ instruments, mode, budget, gross, years, sweepId, tax }),
-    [instruments, mode, budget, gross, years, sweepId, taxOn, divTaxRate]);
+  const planExtras = { contributionGrowth, oneTimeYear, oneTimeAmount, rebalance, withdrawalStartYear, monthlyWithdrawal };
+  const R = useMemo(() => simulate({ instruments, mode, budget, gross, years, sweepId, tax, ...planExtras }),
+    [instruments, mode, budget, gross, years, sweepId, taxOn, divTaxRate, contributionGrowth, oneTimeYear, oneTimeAmount, rebalance, withdrawalStartYear, monthlyWithdrawal]);
 
   // 引擎 Worker：建一次、卸載時收掉。重模擬走 Worker，失敗自動退回主執行緒。
   const workerRef = useRef(null);
@@ -610,6 +690,7 @@ function App() {
   const dInstruments = useDeferredValue(instruments);
   const dGross = useDeferredValue(gross);
   const dYears = useDeferredValue(years);
+  const dTargetYears = useDeferredValue(targetYears);
   const dSigma = useDeferredValue(sigma);
   const dPaths = useDeferredValue(paths);
   const dRho = useDeferredValue(rho);
@@ -618,30 +699,69 @@ function App() {
   const [MC, setMC] = useState(null);
   useEffect(() => {
     if (model !== "parametric") { setMC(null); return; }
-    const args = { instruments: dInstruments, mode, budget, gross: dGross, years: dYears, sigma: dSigma, paths: dPaths, dist, nu, rho: dRho };
+    const args = { instruments: dInstruments, mode, budget, gross: dGross, years: dYears, sigma: dSigma, paths: dPaths, dist, nu, rho: dRho, ...planExtras };
     let cancelled = false;
     runEngine(workerRef.current, "monteCarlo", args, () => monteCarlo(args)).then((r) => { if (!cancelled) setMC(r); });
     return () => { cancelled = true; };
-  }, [model, dInstruments, mode, budget, dGross, dYears, dSigma, dPaths, dist, nu, dRho]);
+  }, [model, dInstruments, mode, budget, dGross, dYears, dSigma, dPaths, dist, nu, dRho, contributionGrowth, oneTimeYear, oneTimeAmount, rebalance, withdrawalStartYear, monthlyWithdrawal]);
 
   // 歷史平穩拔靴（預設模型）：借歷史波動結構，報酬以 gross 假設 recenter。
   const [BS, setBS] = useState(null);
   useEffect(() => {
     if (model !== "bootstrap") { setBS(null); return; }
-    const args = { instruments: dInstruments, mode, budget, gross: dGross, years: dYears, paths: dPaths, avgBlock: 6 };
+    const args = { instruments: dInstruments, mode, budget, gross: dGross, years: dYears, paths: dPaths, avgBlock: 6, ...planExtras };
     let cancelled = false;
     runEngine(workerRef.current, "bootstrapSimulate", args, () => bootstrapSimulate(args)).then((r) => { if (!cancelled) setBS(r); });
     return () => { cancelled = true; };
-  }, [model, dInstruments, mode, budget, dGross, dYears, dPaths]);
+  }, [model, dInstruments, mode, budget, dGross, dYears, dPaths, contributionGrowth, oneTimeYear, oneTimeAmount, rebalance, withdrawalStartYear, monthlyWithdrawal]);
 
   // 統一給圖表用的模擬結果（兩模型 series 同形）。
   const SIM = model === "bootstrap" ? BS : MC;
 
+  // 目標達成率：用目標區塊自己的年期重跑一次模型，避免被上方全域年期綁住。
+  const [TargetSIM, setTargetSIM] = useState(null);
+  useEffect(() => {
+    if (!(targetAmt > 0)) { setTargetSIM(null); return; }
+    const common = { instruments: dInstruments, mode, budget, gross: dGross, years: dTargetYears, paths: dPaths, target: targetAmt, ...planExtras };
+    const args = model === "bootstrap"
+      ? { ...common, avgBlock: 6 }
+      : { ...common, sigma: dSigma, dist, nu, rho: dRho };
+    const fn = model === "bootstrap" ? "bootstrapSimulate" : "monteCarlo";
+    const sync = () => (model === "bootstrap" ? bootstrapSimulate(args) : monteCarlo(args));
+    let cancelled = false;
+    runEngine(workerRef.current, fn, args, sync).then((r) => { if (!cancelled) setTargetSIM(r); });
+    return () => { cancelled = true; };
+  }, [model, targetAmt, dTargetYears, dInstruments, mode, budget, dGross, dPaths, dSigma, dist, nu, dRho, contributionGrowth, oneTimeYear, oneTimeAmount, rebalance, withdrawalStartYear, monthlyWithdrawal]);
+
   // 目標金額回推：達成 targetAmt 所需的每月（或單筆）投入。
   const targetNeed = useMemo(() => (targetAmt > 0
-    ? solveContribution({ instruments, mode, gross, years, sweepId, target: targetAmt, tax })
+    ? solveContribution({ instruments, mode, gross, years: targetYears, sweepId, target: targetAmt, tax, ...planExtras })
     : 0),
-    [targetAmt, instruments, mode, gross, years, sweepId, taxOn, divTaxRate]);
+    [targetAmt, targetYears, instruments, mode, gross, sweepId, taxOn, divTaxRate, contributionGrowth, oneTimeYear, oneTimeAmount, rebalance, withdrawalStartYear, monthlyWithdrawal]);
+
+  // 反推「達標所需年化毛報酬」：固定目前投入與年期，二分搜尋使直線試算期末 ≥ 目標的 gross。
+  // 與 targetNeed 互補——一個答「要投多少」、一個答「要幾 % 報酬」，並對報酬高低給可行性提示。
+  // 直線試算期末對 gross 單調遞增，故二分搜尋必收斂。
+  const requiredReturn = useMemo(() => {
+    if (!(targetAmt > 0)) return null;
+    const base = { instruments, mode, budget, sweepId, tax, ...planExtras };
+    const finalAt = (g) => simulate({ ...base, gross: g, years: targetYears }).finalTotal;
+    if (finalAt(60) < targetAmt) return { rate: Infinity };   // 即使年化 60% 也達不到
+    if (finalAt(0) >= targetAmt) return { rate: 0 };           // 光靠本金（不靠報酬）就達標
+    let lo = 0, hi = 60;
+    for (let i = 0; i < 60; i++) { const mid = (lo + hi) / 2; if (finalAt(mid) >= targetAmt) hi = mid; else lo = mid; }
+    return { rate: hi };
+  }, [targetAmt, targetYears, instruments, mode, budget, sweepId, taxOn, divTaxRate, contributionGrowth, oneTimeYear, oneTimeAmount, rebalance, withdrawalStartYear, monthlyWithdrawal]);
+
+  // 對「所需報酬率」給白話可行性判語：報酬越高＝越要冒波動、歷史上越難持續。
+  const returnVerdict = (rate) => {
+    if (!Number.isFinite(rate)) return { c: C.red, t: "即使年化 60% 也達不到——這個目標相對你目前的投入與年期太高，請拉長年期或提高每月投入。" };
+    if (rate <= 0.5) return { c: C.jade, t: "幾乎光靠本金就能達標，不太需要承擔報酬風險。" };
+    if (rate <= 6) return { c: C.jade, t: "相當保守、容易達成；以全市值型 ETF 長期水準即可，波動也最小。" };
+    if (rate <= 9) return { c: C.blue, t: "接近台股市值型 ETF 的長期水準，合理但需長期紀律、忍受中途波動。" };
+    if (rate <= 12) return { c: C.warn, t: "偏積極，通常得配置較高波動部位；過程回檔可能很深，最怕撐不住而賣在低點。" };
+    return { c: C.red, t: "歷史上長期很難持續，多半得冒很大風險或靠運氣。建議拉長年期、提高投入或下修目標，別硬追高報酬。" };
+  };
 
   // 情境快照：記下目前設定與累積資產序列，供 A/B 疊圖與差異表。
   const takeSnapshot = (label) => ({
@@ -691,11 +811,16 @@ function App() {
     "https://corsproxy.io/?url=" + encodeURIComponent(target),
     "https://api.allorigins.win/raw?url=" + encodeURIComponent(target),
   ];
+  const FETCH_TIMEOUT_MS = 8000;
   // 三個來源並行競速：誰先成功回傳非空陣列就採用（各代理回傳同一份資料，誰先到都正確），
   // 不再序列空等較慢的代理；全部失敗才回 null。
   const raceJson = async (urls, pick) => {
     const attempt = async (url) => {
-      const res = await fetch(url);
+      const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+      const timer = ctl ? setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS) : null;
+      let res;
+      try { res = await fetch(url, ctl ? { signal: ctl.signal } : undefined); }
+      finally { if (timer) clearTimeout(timer); }
       if (!res.ok) throw new Error("bad status " + res.status);
       const data = pick(await res.json());
       if (data) return data;
@@ -867,25 +992,6 @@ function App() {
     if (!b.name) setInstruments((arr) => arr.map((i) => (i.id === id && i.name === "抓取中…" ? { ...i, name: "新標的" } : i)));
   };
 
-  // 設定匯出/匯入（JSON），方便備份與分享；匯入一律經 sanitizeState 清理。
-  const exportConfig = () => {
-    const blob = new Blob([JSON.stringify({ instruments, mode, budget, gross, years, sweepId, sigma, paths, showAdv, model, backtest, dist, nu, rho, cape, taxOn, divTaxRate, realView, infl, targetAmt }, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = "tw-cockpit-config.json"; a.click();
-    URL.revokeObjectURL(url);
-  };
-  const importConfig = (e) => {
-    const file = e.target.files && e.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      try { applyState(sanitizeState(JSON.parse(reader.result))); }
-      catch (err) { alert("匯入失敗：檔案不是有效的設定 JSON。"); }
-    };
-    reader.readAsText(file);
-    e.target.value = ""; // 允許重複匯入同一檔
-  };
   const update = (id, k, v) => setInstruments((arr) => arr.map((i) => (i.id === id ? { ...i, [k]: v } : i)));
   const removeRow = (id) => setInstruments((arr) => {
     const next = arr.filter((i) => i.id !== id);
@@ -905,9 +1011,10 @@ function App() {
     const t = PLAN_TEMPLATES[answers.profile] || PLAN_TEMPLATES["穩健"];
     const base = {
       instruments, mode, budget, gross, years, sweepId, sigma, paths, showAdv,
-      model, backtest, dist, nu, rho, cape, taxOn, divTaxRate, realView, infl, targetAmt,
+      model, backtest, dist, nu, rho, cape, taxOn, divTaxRate, realView, infl, targetAmt, targetYears,
+      contributionGrowth, oneTimeYear, oneTimeAmount, rebalance, withdrawalStartYear, monthlyWithdrawal,
     };
-    const next = { ...base, mode: answers.mode, budget: num(answers.budget), years: answers.years, gross: t.gross, targetAmt: num(answers.target) || 0 };
+    const next = { ...base, mode: answers.mode, budget: num(answers.budget), years: answers.years, gross: t.gross, targetAmt: num(answers.target) || 0, targetYears: answers.years };
     if (scope === "full") {
       const a = allocateByCategory(instruments, t.weights);
       next.instruments = a.instruments;
@@ -927,23 +1034,25 @@ function App() {
     p10: simEnd.p10, p90: simEnd.p90,
     success: model === "bootstrap" ? SIM.risk.successRate * 100 : SIM.aboveInvested,
   } : null;
+  const targetEnd = TargetSIM ? TargetSIM.series[TargetSIM.series.length - 1] : null;
+  const targetStat = TargetSIM && targetEnd ? {
+    p50: TargetSIM.medianFinal,
+    p10: targetEnd.p10,
+    p90: targetEnd.p90,
+    success: model === "bootstrap" ? TargetSIM.risk.successRate * 100 : TargetSIM.targetSuccess,
+  } : null;
 
   return (
-    <div style={{ background: C.canvas, minHeight: "100%", fontFamily: "var(--sans)", color: C.ink, padding: "20px 16px" }}>
-      <div style={{ maxWidth: 940, margin: "0 auto" }}>
+    <div className="app-shell" style={{ background: C.canvas, minHeight: "100%", fontFamily: "var(--sans)", color: C.ink, padding: "20px 16px" }}>
+      <div className="app-wrap" style={{ maxWidth: 940, margin: "0 auto" }}>
         <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
           <div>
             <div style={{ fontSize: 26, fontWeight: 700, letterSpacing: "-.015em" }}>台股配置控制台</div>
             <div style={{ fontSize: 13, color: C.muted, marginTop: 3 }}>分配規劃 · 持續買進 · 未來推估</div>
           </div>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <div className="top-actions" style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <button className="btn" onClick={() => setPlanOpen(true)} aria-label="開啟投資計劃精靈"
               style={{ background: C.red, color: "#fff", borderColor: C.red, fontWeight: 600 }}>投資計劃書</button>
-            <button className="btn" onClick={exportConfig} aria-label="匯出設定為 JSON 檔">匯出</button>
-            <label className="btn" style={{ margin: 0 }}>
-              匯入
-              <input type="file" accept="application/json,.json" onChange={importConfig} aria-label="匯入設定 JSON 檔" style={{ display: "none" }} />
-            </label>
             <button className="btn" onClick={reset} aria-label="重設為預設值"><RotateCcw size={14} /> 重設預設</button>
           </div>
         </div>
@@ -983,13 +1092,47 @@ function App() {
               <span style={{ fontSize: 10.5, color: C.faint, lineHeight: 1.5 }}>股利再投入方式：勾「配息」的標的，其股利每年集中掃進這檔複利；不勾「配息」＝股利留在原檔自己滾。</span>
             </Field>
           </div>
+          <div style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid " + C.border }}>
+            <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 10 }}>現金流與再平衡</div>
+            <div className="grid2" style={{ display: "grid", gridTemplateColumns: "repeat(6,1fr)", gap: 12, alignItems: "start" }}>
+              <Field label="每年投入成長%">
+                <input className="num" type="number" min="0" max="30" step="0.5" value={contributionGrowth}
+                  onChange={(e) => setContributionGrowth(Math.min(30, num(e.target.value)))} aria-label="每年投入成長率" style={{ ...numInput }} />
+              </Field>
+              <Field label="加碼年份">
+                <input className="num" type="number" min="0" max="50" step="1" value={oneTimeYear}
+                  onChange={(e) => setOneTimeYear(Math.min(50, Math.max(0, Math.round(num(e.target.value)))))} aria-label="一次性加碼年份" style={{ ...numInput }} />
+              </Field>
+              <Field label="加碼金額">
+                <input className="num" type="number" min="0" step="10000" value={oneTimeAmount}
+                  onChange={(e) => setOneTimeAmount(num(e.target.value))} aria-label="一次性加碼金額" style={{ ...numInput }} />
+              </Field>
+              <Field label="再平衡">
+                <select value={rebalance} onChange={(e) => setRebalance(e.target.value)} aria-label="再平衡規則" style={{ ...numInput, fontFamily: "var(--sans)" }}>
+                  <option value="none">不再平衡</option>
+                  <option value="annual">每年調回配置</option>
+                </select>
+              </Field>
+              <Field label="提領開始年">
+                <input className="num" type="number" min="0" max="80" step="1" value={withdrawalStartYear}
+                  onChange={(e) => setWithdrawalStartYear(Math.min(80, Math.max(0, Math.round(num(e.target.value)))))} aria-label="退休提領開始年" style={{ ...numInput }} />
+              </Field>
+              <Field label="每月提領">
+                <input className="num" type="number" min="0" step="1000" value={monthlyWithdrawal}
+                  onChange={(e) => setMonthlyWithdrawal(num(e.target.value))} aria-label="退休後每月提領" style={{ ...numInput }} />
+              </Field>
+            </div>
+            <div style={{ fontSize: 10.5, color: C.faint, marginTop: 8, lineHeight: 1.5 }}>
+              加碼年份填 0 代表不加碼；提領開始年填 0 代表不提領。每年投入成長適合模擬薪資成長後逐年加碼，年度再平衡會在每年底把各標的調回配置比例。
+            </div>
+          </div>
         </div>
 
         <div className="card" style={{ padding: 20, marginBottom: 12 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
             <div>
               <div className="section-title">未來資產推估</div>
-              <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>以目前的投入與分配持續買進 {years} 年，資產可能的區間與達標機率。預設用台股歷史報酬做「平穩拔靴」，已含波動與序列報酬風險。</div>
+              <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>以目前的投入與分配持續買進 {years} 年，資產可能的區間與保本機率。預設用台股歷史報酬做「平穩拔靴」，已含波動與序列報酬風險。</div>
             </div>
             <button className="btn" onClick={() => setShowAdv((v) => !v)} aria-pressed={showAdv}
               style={{ background: showAdv ? C.ink : "#fff", color: showAdv ? "#fff" : C.muted, borderColor: showAdv ? C.ink : C.border }}>
@@ -1000,12 +1143,12 @@ function App() {
           {simStat ? (
             <div style={{ marginTop: 16 }}>
               {/* 規劃統計列（永遠顯示） */}
-              <div className="grid2" style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 14, marginBottom: 14 }}>
+              <div className="grid2 stat-grid" style={{ display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 14, marginBottom: 14 }}>
                 <Stat label={mode === "monthly" ? years + " 年累計投入" : "投入本金"} val={fmtWan(R.invested)} sub={fmtNT(R.invested)} />
                 <Stat label="中位數預期 (P50)" val={fmtWan(simStat.p50 / realF)} sub={"成長 " + simStat.mult.toFixed(2) + "×"} color={C.red} />
                 <Stat label="保守 (P10)" val={fmtWan(simStat.p10 / realF)} sub="後 10% 路徑" color={C.warn} />
                 <Stat label="樂觀 (P90)" val={fmtWan(simStat.p90 / realF)} sub="前 10% 路徑" color={C.jade} />
-                <Stat label="達標率" val={simStat.success.toFixed(0) + "%"} sub="期末 ≥ 投入本金" color={C.blue} />
+                <Stat label="保本率" val={simStat.success.toFixed(0) + "%"} sub="期末 ≥ 投入本金" color={C.blue} />
               </div>
 
               {/* 未來資產推估主圖（永遠顯示） */}
@@ -1040,19 +1183,58 @@ function App() {
               {/* 目標金額回推（內嵌） */}
               <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid " + C.border }}>
                 <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 4 }}>目標金額回推</div>
-                <div style={{ fontSize: 11, color: C.muted, marginBottom: 10 }}>輸入想在第 {years} 年達到的金額，回推目前設定下需要的{mode === "monthly" ? "每月" : "單筆"}投入。</div>
+                <div style={{ fontSize: 11, color: C.muted, marginBottom: 10 }}>設定想在幾年內達到的金額，給你兩條達標路徑：① 維持報酬假設、要投多少；② 維持目前投入、需要幾 % 報酬（並提示這個報酬合不合理）。此處年期可獨立設定，不影響上方圖表的全域年期。</div>
                 <div style={{ display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap" }}>
                   <label style={{ fontSize: 12, color: C.muted, display: "flex", gap: 6, alignItems: "center" }}>
                     目標金額 (NT$)
                     <input className="num" type="number" min="0" step="100000" value={targetAmt} onChange={(e) => setTargetAmt(num(e.target.value))} aria-label="目標金額" style={{ ...numInput, width: 140 }} />
                   </label>
+                  <label style={{ fontSize: 12, color: C.muted, display: "flex", gap: 6, alignItems: "center" }}>
+                    幾年內達成
+                    <input className="num" type="number" min="1" max="50" step="1" value={targetYears} onChange={(e) => setTargetYears(clampTargetYears(e.target.value, 1))} aria-label="達成年期" style={{ ...numInput, width: 80 }} />
+                    年
+                  </label>
                   {targetAmt > 0 && (
                     <div style={{ fontSize: 13 }}>
-                      需{mode === "monthly" ? "每月投入" : "單筆投入"} <b className="num" style={{ fontSize: 18, color: C.red }}>{fmtNT(targetNeed)}</b>{" "}
-                      <span style={{ fontSize: 11, color: C.muted }}>（年化 {gross}% 假設、{years} 年{taxOn ? "、含股利稅" : ""}）</span>
+                      ① 需{mode === "monthly" ? "每月投入" : "單筆投入"} <b className="num" style={{ fontSize: 18, color: C.red }}>{fmtNT(targetNeed)}</b>{" "}
+                      <span style={{ fontSize: 11, color: C.muted }}>（年化 {gross}% 假設、{targetYears} 年{taxOn ? "、含股利稅" : ""}）</span>
                     </div>
                   )}
                 </div>
+                {targetAmt > 0 && requiredReturn && (() => {
+                  const v = returnVerdict(requiredReturn.rate);
+                  return (
+                    <div style={{ fontSize: 12.5, lineHeight: 1.7, marginTop: 10, background: "#F4F7FA", borderRadius: 8, padding: "10px 12px" }}>
+                      <div style={{ fontSize: 13 }}>
+                        ② 維持目前{mode === "monthly" ? "每月 " + fmtNT(num(budget)) : "單筆 " + fmtNT(num(budget))}、{targetYears} 年，{Number.isFinite(requiredReturn.rate)
+                          ? <>需要年化約 <b className="num" style={{ fontSize: 18, color: v.c }}>{requiredReturn.rate.toFixed(1)}%</b> 毛報酬才能達標</>
+                          : <b style={{ color: v.c }}>在合理報酬範圍內難以達標</b>}。
+                      </div>
+                      <div style={{ fontSize: 12, color: v.c, marginTop: 4 }}>{v.t}</div>
+                      <div style={{ fontSize: 10.5, color: C.faint, marginTop: 4 }}>提示：報酬率越高代表波動越大，沒有「只高報酬、不高風險」的組合。此為直線試算（中位數）反推，達到此報酬仍約有一半機率因波動而未達標；僅供量級參考，非投資建議。</div>
+                    </div>
+                  );
+                })()}
+                {targetAmt > 0 && (
+                  <div style={{ fontSize: 12.5, lineHeight: 1.7, marginTop: 10, background: "#EEF8F4", borderRadius: 8, padding: "10px 12px" }}>
+                    {targetStat ? (
+                      <>
+                        <div style={{ fontSize: 13 }}>
+                          ③ 維持目前投入、{targetYears} 年，目標達成率約 <b className="num" style={{ fontSize: 18, color: C.jade }}>{targetStat.success.toFixed(0)}%</b>
+                          <span style={{ color: C.muted }}>（期末資產 ≥ {fmtNT(targetAmt)}）</span>。
+                        </div>
+                        <div className="num" style={{ fontSize: 11.5, color: C.muted, marginTop: 4 }}>
+                          P10 {fmtNT(targetStat.p10)} · P50 {fmtNT(targetStat.p50)} · P90 {fmtNT(targetStat.p90)}
+                        </div>
+                        <div style={{ fontSize: 10.5, color: C.faint, marginTop: 4 }}>
+                          {taxOn ? "機率模擬採總報酬假設，未另計股利稅；精準含稅請以上方所需投入為準。" : "此機率使用目前選擇的模型與路徑數估算，路徑數越高結果越穩定。"}
+                        </div>
+                      </>
+                    ) : (
+                      <div style={{ color: C.muted }}>③ 目標達成率計算中…</div>
+                    )}
+                  </div>
+                )}
               </div>
 
               {/* 進階設定（可收合） */}
@@ -1163,15 +1345,15 @@ function App() {
                 </div>
               )}
 
-              {/* 進階風險統計（規劃數列已含 P50/P10/P90/達標率，這裡只補風險面） */}
+              {/* 進階風險統計（規劃數列已含 P50/P10/P90/保本率，這裡只補風險面） */}
               {model === "parametric" ? (
-                <div className="grid2" style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 14, marginBottom: 12 }}>
+                <div className="grid2 stat-grid" style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 14, marginBottom: 12 }}>
                   <Stat label="保本機率" val={MC.aboveInvested.toFixed(0) + "%"} sub="期末 ≥ 投入本金" color={C.blue} />
                   <Stat label="翻倍機率" val={MC.aboveDouble.toFixed(0) + "%"} sub="期末 ≥ 2× 投入" color={C.jade} />
                   <Stat label="隱含幾何報酬" val={MC.cagrImplied.toFixed(2) + "%"} sub={"算術 " + gross + "% − σ²/2"} color={C.ink} />
                 </div>
               ) : (
-                <div className="grid2" style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 14, marginBottom: 12 }}>
+                <div className="grid2 stat-grid" style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 14, marginBottom: 12 }}>
                   <Stat label="最大回撤（中位）" val={(BS.risk.maxDrawdownP50 * 100).toFixed(0) + "%"} sub="一半路徑不超過此跌幅" color={C.warn} />
                   <Stat label="最大回撤（P90，較差）" val={(BS.risk.maxDrawdownP90 * 100).toFixed(0) + "%"} sub="一成路徑跌更深" color={C.red} />
                   <Stat label="最差 5% 期末 (CVaR)" val={fmtWan(BS.risk.cvar05 / realF)} sub="尾端風險" color={C.muted} />
@@ -1203,7 +1385,7 @@ function App() {
               <div className="section-title">標的與配置</div>
               <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>調整每檔的配置比例與參數；上方推估會即時反映。</div>
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div className="mobile-actions" style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <span className="num" style={{ fontSize: 12, color: Math.round(allocSum) === 100 ? C.jade : C.warn }}>
                 配置合計 {allocSum.toFixed(0)}%{Math.round(allocSum) !== 100 ? "（將自動正規化）" : ""}
               </span>
@@ -1217,7 +1399,7 @@ function App() {
             </div>
           )}
 
-          <div style={{ overflowX: "auto" }}>
+          <div className="desktop-table" style={{ overflowX: "auto" }}>
             <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 720 }}>
               <thead>
                 <tr style={{ fontSize: 10.5, color: C.muted, textAlign: "left" }}>
@@ -1258,8 +1440,55 @@ function App() {
               </tbody>
             </table>
           </div>
-          <div style={{ fontSize: 11, color: C.muted, marginTop: 8, lineHeight: 1.6 }}>
-按「新增標的」會跳出輸入框，填代號（如 0056、2412、6505）按確定即立刻抓取名稱、股價、現金殖利率、波動%與內扣%並計入推估；也可直接在「代號」欄改代號（失焦或按 Enter 重抓）。名稱、股價、內扣%、現金殖利%、波動%五欄為自動帶入、已鎖定不可手動編輯（灰底欄位），要更新可重抓代號或按上方「更新股價」。你只需設定「配置%」並勾選「配息」。
+          <div className="mobile-instruments">
+            {R.buys.map((b) => (
+              <div key={b.id} style={{ border: "1px solid " + C.border, borderRadius: 10, padding: 12, background: "#FBFCFD" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", minWidth: 0 }}>
+                    <span style={{ flex: "0 0 auto", width: 10, height: 10, borderRadius: 3, background: b.color }} />
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontWeight: 700, fontSize: 14, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{b.name}</div>
+                      <div className="num" style={{ fontSize: 11, color: C.muted }}>{b.ticker}</div>
+                    </div>
+                  </div>
+                  <button onClick={() => removeRow(b.id)} title="刪除" aria-label={"刪除 " + b.name} style={{ border: "none", background: "none", cursor: "pointer", color: C.muted, padding: 4 }}><Trash2 size={15} /></button>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 10 }}>
+                  <Field label="代號">
+                    <input style={{ ...numInput }} value={b.ticker} aria-label={b.name + " 代號"} placeholder="代號"
+                      onChange={(e) => update(b.id, "ticker", e.target.value)}
+                      onBlur={(e) => autoFillRow(b.id, e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") { fetchedRef.current[b.id] = ""; autoFillRow(b.id, e.target.value); } }} />
+                  </Field>
+                  <Field label="配置%">
+                    <input className="num" aria-label={b.name + " 配置%"} style={{ ...numInput }} type="number" min="0" value={b.alloc} onChange={(e) => update(b.id, "alloc", num(e.target.value))} />
+                  </Field>
+                  <div>
+                    <div style={{ fontSize: 11, color: C.muted }}>股價</div>
+                    <div className="num" style={{ fontSize: 16, fontWeight: 700 }}>{fmtNT(b.price)}</div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 11, color: C.muted }}>股數</div>
+                    <div className="num" style={{ fontSize: 16, fontWeight: 700 }}>{b.shares.toLocaleString()} 股</div>
+                    <div className="num" style={{ fontSize: 10.5, color: C.muted }}>{fmtNT(b.cost)}</div>
+                  </div>
+                  <div style={{ fontSize: 11, color: C.muted }}>
+                    內扣 <span className="num" style={{ color: C.ink }}>{b.fee}%</span> · 殖利 <span className="num" style={{ color: C.ink }}>{b.divYield}%</span> · 波動 <span className="num" style={{ color: C.ink }}>{b.sigma}%</span>
+                  </div>
+                  <label style={{ fontSize: 12, color: C.muted, display: "flex", justifyContent: "flex-end", gap: 6, alignItems: "center" }}>
+                    配息
+                    <input type="checkbox" aria-label={b.name + " 是否配息"} checked={b.distributes} onChange={(e) => update(b.id, "distributes", e.target.checked)} style={{ accentColor: C.jade, width: 18, height: 18 }} />
+                  </label>
+                </div>
+                {fetchingId === b.id && <div style={{ fontSize: 11, color: C.blue, marginTop: 8 }}>抓取中…</div>}
+              </div>
+            ))}
+          </div>
+          <button className="btn mobile-only" onClick={() => setShowInstrumentHelp((v) => !v)} style={{ marginTop: 8 }}>
+            {showInstrumentHelp ? "收合使用說明" : "展開使用說明"}
+          </button>
+          <div className={"help-copy " + (showInstrumentHelp ? "mobile-help-open" : "")}>
+	按「新增標的」會跳出輸入框，填代號（如 0056、2412、6505）按確定即立刻抓取名稱、股價、現金殖利率、波動%與內扣%並計入推估；也可直接在「代號」欄改代號（失焦或按 Enter 重抓）。名稱、股價、內扣%、現金殖利%、波動%五欄為自動帶入、已鎖定不可手動編輯（灰底欄位），要更新可重抓代號或按上方「更新股價」。你只需設定「配置%」並勾選「配息」。
             「內扣%」（總費用率）因無免金鑰公開 API，改由內建費率表帶入：常見 ETF 採公開資料估值、個股為 0、未收錄的 ETF 給保守估值（0.4%）；費率每年會微調，數字僅供規劃參考。
             「配息」其實是選股利再投入方式，兩種都會再投資、差別在投到哪：打勾＝該檔現金股利每年底自動「掃進」你選的複利目標（預設 009816）集中滾；不打勾＝股利留在原檔自己複利（等同原地再投入）。複利目標本身不配息、吸收各檔掃來的股利全部滾入。注意：勾不勾都不是把錢領出來花掉。
             「波動%」是各標的年化波動度，供進階「參數化」模型逐標的模擬用；歷史拔靴模型不使用此欄。
@@ -1369,7 +1598,7 @@ function App() {
       </div>
 
       {addOpen && <AddInstrumentPrompt onConfirm={addInstrument} onClose={() => setAddOpen(false)} />}
-      {planOpen && <PlanWizard instruments={instruments} mode={mode} budget={budget} years={years} onApply={applyPlan} onClose={() => setPlanOpen(false)} />}
+      {planOpen && <PlanWizard instruments={instruments} mode={mode} budget={budget} years={years} planExtras={planExtras} onApply={applyPlan} onClose={() => setPlanOpen(false)} />}
     </div>
   );
 }
